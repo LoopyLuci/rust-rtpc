@@ -91,7 +91,7 @@ use ra_ap_ide_diagnostics::{Diagnostic as RaDiag, DiagnosticsConfig};
 use ra_ap_paths::AbsPathBuf;
 
 fn diags_for_text(text: &str) -> Vec<rpc_diagnostics::Diagnostic> {
-    let proc_macro_cwd = triomphe::Arc::new(AbsPathBuf::try_from("/").unwrap());
+    let proc_macro_cwd = triomphe::Arc::new(AbsPathBuf::try_from("X:/").unwrap());
     let (analysis, file_id) =
         Analysis::from_single_file(text.to_string(), proc_macro_cwd);
     let config = DiagnosticsConfig::test_sample();
