@@ -29,7 +29,7 @@ version = "0.1.0"
 license = "MIT OR Apache-2.0"
 edition = "2024"
 rust-version = "1.98"
-repository = "https://github.com/nousresearch/rust-rtpc"
+repository = "https://github.com/LoopyLuci/rust-rtpc"
 
 [workspace.dependencies]
 # Shared dependencies are declared here and inherited by member crates.
