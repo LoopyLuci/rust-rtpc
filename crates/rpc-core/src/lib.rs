@@ -12,7 +12,7 @@
 //!
 //! Two engine implementations ship:
 //!   - `MockEngine` — deterministic, synchronous reference engine (F2).
-//!   - `SalsaEngine` — real Salsa 0.28 engine, opt-in (`salsa` feature).
+//!   - `RaApEngine` — real rust-analyzer (`ra_ap_ide`) diagnostics engine, opt-in (`salsa` feature).
 
 #![cfg_attr(not(test), warn(missing_docs))]
 #![cfg_attr(not(test), warn(rust_2018_idioms, unused_crate_dependencies))]

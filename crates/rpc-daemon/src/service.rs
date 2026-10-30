@@ -30,6 +30,9 @@ pub enum ServiceError {
     /// An internal error.
     #[error("internal: {0}")]
     Internal(String),
+    /// A query exceeded its `timeout_ms` deadline.
+    #[error("query {1} timed out after {0} ms")]
+    Timeout(u64, QueryId),
 }
 
 /// A callable tool. Tools let an agent ask the daemon to do something beyond
@@ -169,10 +172,51 @@ impl DaemonService for Daemon {
         // Enqueue: bump the queued counter (scheduler-relevant).
         self.queued.fetch_add(1, Ordering::Relaxed);
         let id = QueryId::new(self.next_id.fetch_add(1, Ordering::Relaxed).to_string());
-        let result = self.engine.query(q);
-        self.store(&id, result);
+        // Run the engine on a worker thread so a runaway query cannot stall the
+        // daemon, while enforcing the caller's `timeout_ms` deadline. A `0`
+        // deadline means "no timeout" — wait for the worker to finish.
+        let timeout_ms = q.timeout_ms;
+        let deadline =
+            if timeout_ms == 0 { None } else { Some(std::time::Duration::from_millis(timeout_ms)) };
+        let engine = Arc::clone(&self.engine);
+        let (tx, rx) = std::sync::mpsc::channel::<QueryResult>();
+        let worker = std::thread::spawn(move || {
+            let result = engine.query(q);
+            let _ = tx.send(result);
+        });
+        let outcome = match deadline {
+            Some(dl) => match rx.recv_timeout(dl) {
+                Ok(res) => {
+                    self.store(&id, res);
+                    Ok(id)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Best-effort cancel of any in-flight engine work. The worker
+                    // is detached and its late result is discarded.
+                    self.engine.cancel();
+                    Err(ServiceError::Timeout(timeout_ms, id))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(ServiceError::Internal("query engine thread panicked".to_string()))
+                }
+            },
+            None => match rx.recv() {
+                Ok(res) => {
+                    self.store(&id, res);
+                    Ok(id)
+                }
+                Err(std::sync::mpsc::RecvError) => {
+                    Err(ServiceError::Internal("query engine thread panicked".to_string()))
+                }
+            },
+        };
         self.queued.fetch_sub(1, Ordering::Relaxed);
-        Ok(id)
+        // Drop the handle only once the result is in — otherwise let the worker
+        // finish detached (cancel already issued).
+        if outcome.is_ok() {
+            drop(worker);
+        }
+        outcome
     }
 
     fn poll(&self, qid: &QueryId) -> Result<QueryResult, ServiceError> {
@@ -185,7 +229,10 @@ impl DaemonService for Daemon {
     }
 
     fn cancel(&self, _qid: &QueryId) -> Result<(), ServiceError> {
-        // Reference engine has no in-flight work to cancel.
+        // Best-effort: signal the engine to cancel in-flight work. Engines that
+        // track work (e.g. a future SalsaEngine) honor this; reference engines
+        // no-op.
+        self.engine.cancel();
         Ok(())
     }
 

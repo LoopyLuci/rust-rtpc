@@ -90,7 +90,7 @@ use ra_ap_ide_db::{assists::AssistResolveStrategy, Severity as RaSeverity};
 use ra_ap_ide_diagnostics::{Diagnostic as RaDiag, DiagnosticsConfig};
 use ra_ap_paths::AbsPathBuf;
 
-fn diags_for_text(text: &str) -> Vec<rpc_diagnostics::Diagnostic> {
+fn diags_for_text(text: &str, file: &str) -> Vec<rpc_diagnostics::Diagnostic> {
     let proc_macro_cwd = triomphe::Arc::new(AbsPathBuf::try_from("X:/").unwrap());
     let (analysis, file_id) =
         Analysis::from_single_file(text.to_string(), proc_macro_cwd);
@@ -99,8 +99,27 @@ fn diags_for_text(text: &str) -> Vec<rpc_diagnostics::Diagnostic> {
         .full_diagnostics(&config, AssistResolveStrategy::None, file_id)
         .unwrap_or_default()
         .into_iter()
-        .map(|d: RaDiag| map_diagnostic(d))
+        .filter(|d| d.severity != RaSeverity::Allow)
+        .map(|d| map_diagnostic(d, file))
         .collect()
+}
+
+fn map_diagnostic(d: RaDiag, file: &str) -> rpc_diagnostics::Diagnostic {
+    let severity = match d.severity {
+        RaSeverity::Error => rpc_diagnostics::Severity::Error,
+        RaSeverity::Warning | RaSeverity::WeakWarning => rpc_diagnostics::Severity::Warning,
+        RaSeverity::Allow => rpc_diagnostics::Severity::Warning,
+    };
+    let start = u32::from(d.range.range.start());
+    let end = u32::from(d.range.range.end());
+    rpc_diagnostics::Diagnostic {
+        schema_version: rpc_diagnostics::SCHEMA_VERSION,
+        code: d.code.as_str().to_string(),
+        severity,
+        message: d.message,
+        spans: vec![rpc_diagnostics::TextSpan::new(file.to_string(), start, end)],
+        suggestions: Vec::new(),
+    }
 }
 ```
 

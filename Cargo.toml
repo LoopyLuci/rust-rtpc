@@ -18,8 +18,16 @@ members = [
 ]
 
 [profile.release]
-lto = "thin"
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+# Faster iterative rebuilds while developing (the daemon is the perf target, not
+# the dev build).
+incremental = true
 
 [profile.dev.package."*"]
 opt-level = 3

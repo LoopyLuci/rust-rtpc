@@ -36,7 +36,7 @@ use ra_ap_paths::AbsPathBuf;
 ///
 /// `Analysis::from_single_file` builds a self-contained ra_ap world (parser +
 /// HIR + crate graph with std) and returns a file id we can query.
-fn diags_for_text(text: &str) -> Vec<Diagnostic> {
+fn diags_for_text(text: &str, file: &str) -> Vec<Diagnostic> {
     let proc_macro_cwd = TriompheArc::new(AbsPathBuf::try_from("X:/").unwrap());
     let (analysis, file_id) = Analysis::from_single_file(text.to_string(), proc_macro_cwd);
     let config = DiagnosticsConfig::test_sample();
@@ -45,12 +45,12 @@ fn diags_for_text(text: &str) -> Vec<Diagnostic> {
         .unwrap_or_default()
         .into_iter()
         .filter(|d| d.severity != RaSeverity::Allow)
-        .map(map_diagnostic)
+        .map(|d| map_diagnostic(d, file))
         .collect()
 }
 
 /// Translate a rust-analyzer `Diagnostic` into the wire `rpc_diagnostics::Diagnostic`.
-fn map_diagnostic(d: ra_ap_ide_diagnostics::Diagnostic) -> Diagnostic {
+fn map_diagnostic(d: ra_ap_ide_diagnostics::Diagnostic, file: &str) -> Diagnostic {
     let severity = match d.severity {
         RaSeverity::Error => WireSeverity::Error,
         RaSeverity::Warning | RaSeverity::WeakWarning => WireSeverity::Warning,
@@ -66,7 +66,7 @@ fn map_diagnostic(d: ra_ap_ide_diagnostics::Diagnostic) -> Diagnostic {
         code: d.code.as_str().to_string(),
         severity,
         message: d.message,
-        spans: vec![TextSpan::new(String::new(), start, end)],
+        spans: vec![TextSpan::new(file.to_string(), start, end)],
         suggestions: Vec::new(),
     }
 }
@@ -127,7 +127,8 @@ impl IncrementalEngine for RaApEngine {
                     let files = self.files.lock().unwrap();
                     files.get(&path).cloned().unwrap_or_default()
                 };
-                let diags = diags_for_text(&text);
+                let file = path.to_string_lossy().to_string();
+                let diags = diags_for_text(&text, &file);
                 QueryResult::Diagnoses { path, diagnostics: diags, revision: self.revision() }
             }
             QueryKind::ParseSummary { path } => {

@@ -29,21 +29,23 @@ pub fn run(
     daemon: &crate::service::Daemon,
     stream: &mut std::net::TcpStream,
 ) -> std::io::Result<()> {
+    // One BufReader for the whole stream so incoming bytes are buffered (a fresh
+    // BufReader per iteration discards the buffer and issues a syscall per byte).
+    // Writes go through `get_mut()` straight to the socket (TcpStream is
+    // unbuffered, so `flush()` is effectively a no-op but kept for clarity).
+    let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
-        {
-            let mut reader = BufReader::new(&mut *stream);
-            let n = reader.read_line(&mut line)?;
-            if n == 0 {
-                break Ok(());
-            }
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break Ok(());
         }
         if line.trim().is_empty() {
             continue;
         }
         let resp = dispatch(daemon, &line);
-        writeln!(stream, "{}", serde_json::to_string(&resp).unwrap())?;
-        stream.flush()?;
+        writeln!(reader.get_mut(), "{}", serde_json::to_string(&resp).unwrap())?;
+        reader.get_mut().flush()?;
     }
 }
 
