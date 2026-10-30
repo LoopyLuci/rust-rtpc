@@ -27,6 +27,5 @@ pub use rpc_diagnostics::{
 pub mod engine;
 pub mod types;
 
-
 #[cfg(feature = "salsa")]
 pub mod salsa_engine;

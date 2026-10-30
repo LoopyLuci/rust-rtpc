@@ -28,7 +28,7 @@ use crate::engine::{ApplyError, ChangePack, IncrementalEngine, Revision};
 use crate::types::{Query, QueryKind, QueryResult};
 
 use ra_ap_ide::Analysis;
-use ra_ap_ide_db::{assists::AssistResolveStrategy, Severity as RaSeverity};
+use ra_ap_ide_db::{Severity as RaSeverity, assists::AssistResolveStrategy};
 use ra_ap_ide_diagnostics::DiagnosticsConfig;
 use ra_ap_paths::AbsPathBuf;
 
@@ -37,7 +37,7 @@ use ra_ap_paths::AbsPathBuf;
 /// `Analysis::from_single_file` builds a self-contained ra_ap world (parser +
 /// HIR + crate graph with std) and returns a file id we can query.
 fn diags_for_text(text: &str) -> Vec<Diagnostic> {
-    let proc_macro_cwd = TriompheArc::new(AbsPathBuf::try_from("/").unwrap());
+    let proc_macro_cwd = TriompheArc::new(AbsPathBuf::try_from("X:/").unwrap());
     let (analysis, file_id) = Analysis::from_single_file(text.to_string(), proc_macro_cwd);
     let config = DiagnosticsConfig::test_sample();
     analysis
@@ -128,11 +128,7 @@ impl IncrementalEngine for RaApEngine {
                     files.get(&path).cloned().unwrap_or_default()
                 };
                 let diags = diags_for_text(&text);
-                QueryResult::Diagnoses {
-                    path,
-                    diagnostics: diags,
-                    revision: self.revision(),
-                }
+                QueryResult::Diagnoses { path, diagnostics: diags, revision: self.revision() }
             }
             QueryKind::ParseSummary { path } => {
                 let text = {
@@ -178,9 +174,7 @@ mod tests {
     #[test]
     fn ra_ap_diagnostic_round_trip() {
         let engine = RaApEngine::new();
-        engine
-            .apply_changes(ChangePack::new(vec![fix("/src/main.rs", "fn =() {")]))
-            .unwrap();
+        engine.apply_changes(ChangePack::new(vec![fix("/src/main.rs", "fn =() {")])).unwrap();
         let result = engine.query(diag_q("/src/main.rs"));
         match result {
             QueryResult::Diagnoses { diagnostics, .. } => {
@@ -200,9 +194,7 @@ mod tests {
     #[test]
     fn ra_ap_clean_file_has_no_diagnostics() {
         let engine = RaApEngine::new();
-        engine
-            .apply_changes(ChangePack::new(vec![fix("/src/main.rs", "fn main() {}")]))
-            .unwrap();
+        engine.apply_changes(ChangePack::new(vec![fix("/src/main.rs", "fn main() {}")])).unwrap();
         let result = engine.query(diag_q("/src/main.rs"));
         match result {
             QueryResult::Diagnoses { diagnostics, .. } => {
@@ -219,9 +211,7 @@ mod tests {
     #[test]
     fn ra_ap_query_timing() {
         let engine = RaApEngine::new();
-        engine
-            .apply_changes(ChangePack::new(vec![fix("/src/main.rs", "fn main() {}")]))
-            .unwrap();
+        engine.apply_changes(ChangePack::new(vec![fix("/src/main.rs", "fn main() {}")])).unwrap();
         let start = std::time::Instant::now();
         engine.query(diag_q("/src/main.rs"));
         let elapsed = start.elapsed();
