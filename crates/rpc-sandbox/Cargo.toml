@@ -1,0 +1,11 @@
+[package]
+name = "rpc-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Restricted-process policy for build scripts and proc macros."
+
+[dependencies]
+rpc-codegen = { path = "../rpc-codegen" }

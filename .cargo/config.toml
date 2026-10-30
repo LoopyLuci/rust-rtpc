@@ -1,0 +1,7 @@
+# All build output and toolchains live on the X: drive. Never write to C:.
+[env]
+CARGO_TARGET_DIR = { value = "X:/cargo-target", relative = false }
+
+[unstable]
+# Allow `cargo build -Z` features used by CI only when explicitly enabled.
+# Kept minimal: no unstable host features enabled by default.

@@ -1,0 +1,10 @@
+[package]
+name = "taskr"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Sample workspace target for the real-time pre-compiler spikes."
+
+[[bin]]
+name = "taskr"
+path = "src/main.rs"

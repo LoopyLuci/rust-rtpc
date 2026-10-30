@@ -1,0 +1,1243 @@
+Rust real-time pre-compiler
+
+"Do deep and extensive research and analysis on the optimal ways to design and develop an optimal next generation and production grade quality Rust real time pre-compiler that monitors the code you are working on live and is building everything in real time based on what is available. Provide comprehensive in depth and detailed suggestions for the optimal way to achieve this goal"
+
+# Designing a Production-Grade Real-Time Rust Pre-Compiler
+
+## Executive Summary
+
+The optimal architecture for a real-time Rust pre-compiler is **not** a reimplementation of `rustc` from scratch, nor a naive file-watcher that shells out to `cargo build` on every keystroke. It is a **persistent, query-driven compilation daemon** that maintains a live semantic model of the workspace in memory, applies source changes through a transactional virtual file system, and selectively drives two distinct back-ends: a **fast semantic front-end** (for diagnostics, type information, and incremental checking) and a **code-generation/linking back-end** (for producing artifacts or hot-patching a running process).
+
+This architecture mirrors the proven designs of `rust-analyzer` (Salsa-based live query graph) and `rustc` (red–green incremental compilation), while borrowing production techniques from `ra-jit` and Subsecond for function-level hot reloading. The result is a system that can respond to edits in **single-digit to low-tens of milliseconds** for semantic feedback and **tens to low-hundreds of milliseconds** for code generation of changed functions—orders of magnitude faster than cold `cargo build` cycles.
+
+The sections below detail the recommended architecture, component designs, production hardening requirements, and a phased implementation roadmap.
+
+---
+
+## 1. Architectural Foundation: A Query-Based Compiler Daemon
+
+### 1.1 Why a Query System Is Non-Negotiable
+
+The single most important design decision is to build the entire pre-compiler around a **demand-driven, memoized query graph**. In `rustc`, every computation that should be cached—parsing, macro expansion, type checking, MIR construction, codegen—is expressed as a query, and the compiler records a **query DAG** that tracks which queries depend on which others. On subsequent compilations, the **red–green algorithm** assigns each query a colour: green if its result is unchanged, red if it changed, and the **try-mark-green** algorithm short-circuits recomputation when all inputs to a query are green.
+
+For a real-time pre-compiler, the query model provides three critical properties:
+
+1. **Fine-grained invalidation**: Editing one function does not re-type-check the entire crate; only the queries downstream of that function’s syntax are re-evaluated.
+2. **Lazy evaluation**: Queries are computed only when demanded by a consumer (a diagnostic, a codegen unit, or an IDE request). This means the daemon never does more work than is necessary to answer the current question.
+3. **Persistence and memoization**: Query results can be cached in memory across edits and serialized to disk across daemon restarts, turning cold starts into warm starts.
+
+The recommended foundation is **Salsa 3.0+**, the incremental computation framework that `rust-analyzer` has migrated to and that is explicitly designed for on-demand, incrementalized computation. Salsa provides tracked functions, input structs, interned structs, durability levels, and—critically for a production daemon—parallel query execution and (in recent versions) serialization to disk.
+
+### 1.2 High-Level Data Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         PRE-COMPILER DAEMON                           │
+│                                                                       │
+│  ┌────────────┐    ┌─────────────────────────────────────────────┐   │
+│  │  File      │    │           SALSA QUERY DATABASE               │   │
+│  │  Watcher   │───▶│  (persistent, in-memory, parallel)           │   │
+│  │  (notify)  │    │                                               │   │
+│  └────────────┘    │  Inputs: VFS file contents, Cargo.toml,      │   │
+│         │          │          compiler flags, env vars            │   │
+│         ▼          │                                               │   │
+│  ┌────────────┐    │  Derived queries:                            │   │
+│  │  VFS &     │    │    parse(file) → SyntaxTree                  │   │
+│  │  Change    │───▶│    expand_macros(file) → ExpandedAst          │   │
+│  │  Coalescer │    │    resolve_names(crate) → DefMap              │   │
+│  └────────────┘    │    infer_types(def_id) → Ty                   │   │
+│                    │    build_mir(def_id) → MirBody               │   │
+│                    │    codegen_unit(cgu_id) → ObjectFile         │   │
+│                    └──────────────┬──────────────────────────────┘   │
+│                                   │                                  │
+│                    ┌──────────────┴──────────────┐                   │
+│                    │                             │                   │
+│                    ▼                             ▼                   │
+│         ┌──────────────────┐         ┌──────────────────────┐       │
+│         │  SEMANTIC         │         │  CODEGEN & LINKING   │       │
+│         │  BACK-END         │         │  BACK-END            │       │
+│         │                   │         │                      │       │
+│         │  • Diagnostics    │         │  • rustc_driver or   │       │
+│         │  • Type info      │         │    Cranelift         │       │
+│         │  • Hover/refs     │         │  • Subsecond         │       │
+│         │  • Check results  │         │    ThinLinking       │       │
+│         └──────────────────┘         │  • mold/lld linker   │       │
+│                                      └──────────────────────┘       │
+│                                                                       │
+│  ┌──────────────────────────────────────────────────────────────┐    │
+│  │  ORCHESTRATOR: priority scheduling, cancellation, debouncing │    │
+│  └──────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. Component Deep Dive
+
+### 2.1 Virtual File System and Change Detection
+
+The VFS is the daemon’s source of truth for file contents. `rust-analyzer`’s VFS design is the reference model: it stores all files read by the analyzer, and a **change pack** is pushed to Salsa to trigger incremental recomputation. The VFS deliberately does **not** do IO or file watching itself; those are abstracted behind traits for loading and watching, allowing the same VFS to be driven by different event sources (native OS events, LSP notifications, or polling).
+
+For a production pre-compiler, the VFS should incorporate the following:
+
+- **Content hashing and deduplication**: Every file change is hashed before being applied. If the content hash is unchanged (e.g., a `git checkout` that touches mtime without changing content), the VFS suppresses the update. This is exactly how `rust-analyzer` avoids spurious recomputation.
+- **Debouncing with coalescing**: File watchers on all major platforms (`notify` crate) can emit multiple events for a single atomic save (write temp file → rename). The daemon must debounce at the 30–100 ms scale and coalesce events by path before applying a single `Change` set to Salsa.
+- **TOCTOU awareness**: On macOS, FSEvents is explicitly *not* designed for real-time notification—the latency parameter is intended to coalesce events, and atomic snapshots of changed files are not provided. The VFS should therefore read file contents after receiving an event and compare hashes, rather than trusting that the event payload contains the final content.
+- **Bulk change handling**: Operations like `git checkout` or `cargo update` can touch hundreds of files. The VFS should support a transactional “bulk apply” mode that suppresses intermediate recomputation and triggers a single invalidation pass after the batch completes.
+
+### 2.2 The Salsa Query Database
+
+#### 2.2.1 Struct Type Selection
+
+Salsa offers three kinds of structs: **input**, **tracked**, and **interned**. Choosing the correct kind is the primary determinant of both performance and memory behaviour.
+
+- **Inputs**: File contents, compiler flags, Cargo metadata, environment variables. Inputs are set externally and are the roots of the query graph.
+- **Tracked structs**: Definitions, type inferences, MIR bodies, diagnostics. The fields of a tracked struct are compared for equality to determine whether downstream queries can be marked green. The granularity trade-off is critical: if a tracked struct contains a large vector and any element changes, the entire struct is invalidated. For fine-grained invalidation, split data into multiple tracked structs.
+- **Interned structs**: Types, paths, names, and other high-duplication data. Interning reduces memory usage and makes equality comparison O(1). However, interning has a known interaction with garbage collection: old interned values can accumulate. The recommended strategy is either (a) track interning at a rough revision level and collect wholesale, or (b) scope interning to specific query contexts so values are naturally collected when the query result is evicted.
+
+#### 2.2.2 Durability Levels
+
+Salsa’s **durability** concept allows queries to skip validation work when an input’s durability is higher than the changed input. For a Rust pre-compiler, durability can be assigned as follows:
+
+| Durability | Examples | Validation Cost |
+|---|---|---|
+| **High** | Standard library sources, toolchain metadata | Almost never validated |
+| **Medium** | `Cargo.toml`, dependency sources | Validated on manifest change |
+| **Low** | Local workspace source files | Validated on every edit |
+
+This allows the daemon to avoid traversing the dependency graph for toolchain and dependency changes on every keystroke. `rust-analyzer` has reported that without durability, Salsa’s validation logic can spend as much as **90 ms revalidating a no-op change**; durability is the primary mitigation.
+
+#### 2.2.3 Parallel Query Execution
+
+Salsa supports parallel query execution through a Rayon-based thread pool. The query model is inherently parallelizable because query results are immutable and the dependency graph is acyclic—if two threads attempt to compute the same query, one computes and the other blocks until the result is available, with no possibility of deadlock.
+
+For a real-time daemon, parallelism should be applied at two levels:
+
+1. **Intra-request parallelism**: When a diagnostic request requires type-checking many functions, those functions can be checked in parallel. Salsa’s `par_iter` over tracked structs enables this pattern.
+2. **Inter-request parallelism**: The daemon should maintain a thread pool and dispatch incoming requests (file save → check, file save → codegen) to idle threads. `rust-analyzer`’s scheduler uses a main thread pool configurable by the user, defaulting to physical cores, with incoming requests queued when all threads are busy.
+
+**Cancellation** is essential: when a new edit arrives while a long-running query is executing, the old query should be cancelled and its resources reclaimed. Salsa 3.0 provides cancellation hooks that propagate through the query stack.
+
+#### 2.2.4 Persistent Caching
+
+The ability to serialize the Salsa database to disk and reload it on daemon restart transforms cold-start performance. The high-level strategy documented for Salsa serialization is:
+
+1. Mark tracked structs and inputs as `serialize`.
+2. Provide a set of **serialization roots**—the inputs from which all serializable derived data is reachable.
+3. On serialization, Salsa performs a fixed-point traversal from the roots, serializing memos and the tracked/interned structs they reference.
+4. On deserialization, the database is restored lazily: only the requested queries are materialized, and their dependencies are deserialized on demand.
+
+For production, the serialized cache should be **content-addressed** by a hash of the compiler version, feature flags, and Cargo manifest. This ensures that a toolchain update or feature change automatically invalidates the cache without manual intervention.
+
+### 2.3 Front-End Pipeline
+
+The front-end is responsible for turning source text into a semantically analysed, type-checked representation. The recommended pipeline follows `rust-analyzer`’s architecture but must also produce `rustc`-compatible MIR for codegen.
+
+| Stage | Recommended Approach | Key Considerations |
+|---|---|---|
+| **Lexing & Parsing** | Rowen-style lossless syntax trees (`rowan` crate), producing a `GreenNode` that is immutable and cheaply shareable. | Error recovery must be robust; a parse error in one item should not invalidate the entire file. |
+| **Macro Expansion** | Query-driven expansion with memoization per macro invocation. | Macro expansion is historically the most complex part of Rust’s front-end. Expect to invest heavily here. |
+| **Name Resolution** | Build a `DefMap` per crate, using tracked structs for modules and items. | The def-map should be fine-grained enough that adding one function does not invalidate the entire crate’s name resolution. |
+| **Type Inference** | Use an inference context that is query-isolated per function body. | Salsa’s tracked functions should wrap inference per `DefId`, not per crate. |
+| **Trait Solving** | Integrate a trait solver (either the new `rustc` solver or a compatible implementation) as a query. | The new trait solver has its own caching layer (`DepGraph::with_anon_task`) that must be wired into the query system. |
+| **MIR Construction** | Build MIR per function, cached as a query result. | MIR must be compatible with the chosen codegen back-end (see §2.4). |
+| **Diagnostics** | Emit diagnostics as the by-product of queries; do not run a separate diagnostic pass. | Diagnostics should carry stable spans and be deduplicated across query re-executions. |
+
+A critical design choice is whether to **reuse `rust-analyzer`’s existing crates** (`ra_ap_*`) as the front-end or to build a custom front-end. For a production system, reusing `rust-analyzer`’s parsing, macro expansion, name resolution, and type inference crates is strongly recommended: these are mature, heavily tested, and already designed around Salsa. The daemon then adds the codegen and orchestration layers on top.
+
+### 2.4 Codegen and Linking Back-End
+
+The codegen back-end is where the real-time pre-compiler diverges most sharply from a traditional compiler. There are three viable strategies, and the optimal design may combine them depending on the use case.
+
+#### Strategy A: `rustc_driver` in a Subprocess (Recommended for Full Builds)
+
+`rustc` itself can be embedded as a library via the `rustc_driver` crate, but this requires the unstable `rustc_private` feature and exposes the daemon to the full instability of the compiler’s internal APIs. For production reliability, the daemon should **not** link `rustc_driver` directly. Instead, it should invoke `rustc` as a subprocess, passing it a **pre-computed query cache** or a serialized HIR/MIR representation where possible.
+
+The subprocess boundary provides:
+- **Crash isolation**: An internal compiler error (ICE) in `rustc` kills only the subprocess, not the daemon.
+- **Toolchain flexibility**: The daemon can target different Rust toolchains without recompilation.
+- **Sandboxing**: The subprocess can be confined with `seccomp`, namespaces, or a microVM to contain malicious build scripts and proc macros.
+
+The downside is process startup overhead, but this can be amortized by keeping a pool of warm `rustc` subprocesses or by using the `rustc` server protocol if it matures.
+
+#### Strategy B: Cranelift for Fast Debug Codegen
+
+For development builds, the Cranelift back-end offers significantly faster code generation than LLVM, at the cost of less optimized code. A real-time pre-compiler can use Cranelift for the “check and run” loop and reserve LLVM for release builds. This is particularly attractive because the daemon can emit Cranelift object files for changed functions without invoking the full LLVM pipeline.
+
+#### Strategy C: Function-Level Hot-Patching (Subsecond / ThinLinking)
+
+For live-editing a running process, the optimal approach is **function-level hot-patching**, as implemented by Subsecond and `ra-jit`:
+
+1. The daemon compiles only the changed functions into a **patch dynamic library**.
+2. The patch library is loaded into the running process via `libloading`.
+3. A **jump table** indirection layer redirects calls to the new function addresses.
+4. Address Space Layout Randomization (ASLR) is handled by computing offsets from a stable anchor symbol (e.g., `main`).
+
+This approach has been demonstrated to achieve **7 ms live-edit latency** for a single function change, versus 169 ms for incremental `cargo build`, and **37–71 ms** for function edits in real-world projects like `ripgrep`, `fd`, and `bat`. The key enabler is **ThinLinking**, which compiles only modified functions rather than re-linking the entire binary.
+
+The trade-offs of hot-patching are significant and must be surfaced to users:
+- Struct layout changes are **not supported** (size/alignment changes can crash the process).
+- Only the “tip” crate (the binary crate) can be patched in current implementations; library crates are ignored.
+- Globals and thread-locals have partial support with documented limitations.
+
+For a production pre-compiler, hot-patching should be an **opt-in mode** for development workflows, with clear guardrails and automatic fallback to a full rebuild when unsupported changes are detected.
+
+#### Linking
+
+Regardless of codegen strategy, the linker is often the long pole in incremental builds. On Linux, **mold** is approximately 4× faster than `lld` and ~23× faster than the default BFD linker; `lld` is a solid cross-platform alternative. The daemon should detect available linkers and configure the fastest option automatically, while allowing users to override.
+
+### 2.5 Orchestration and Scheduling
+
+The orchestrator is the “brain” of the daemon. It receives change events from the VFS, decides what work to schedule, prioritizes tasks, and cancels stale work. Recommended design:
+
+- **Priority queue with multiple lanes**:
+  1. **Semantic diagnostics** (highest priority, user-facing).
+  2. **Type-check / check-mode compilation** (next highest).
+  3. **Codegen for hot-patch / debug artifact** (medium priority).
+  4. **Full release build / test run** (lowest priority, may be deferred).
+- **Debouncing and coalescing**: A single save can trigger multiple file events. The orchestrator should wait for a short quiescence window (e.g., 50 ms) before dispatching work, and coalesce changes to the same file.
+- **Cancellation**: When a new edit arrives, any in-flight work for the previous revision should be cancelled if it has not yet produced a result. Salsa’s cancellation mechanism propagates through query execution.
+- **Backpressure**: If the user types continuously, the daemon should not accumulate an unbounded queue of codegen tasks. It should drop or supersede low-priority tasks.
+
+---
+
+## 3. Production-Grade Concerns
+
+### 3.1 Stability and Fault Isolation
+
+A production pre-compiler must assume that any component can fail—including `rustc` itself.
+
+| Failure Mode | Mitigation |
+|---|---|
+| **ICE in `rustc` subprocess** | Run codegen in a subprocess; capture the ICE file and backtrace; report a structured error; continue serving semantic features from the front-end. |
+| **Salsa panic** | Catch panics at the query boundary where possible; for unrecoverable panics, restart the database from the last serialized checkpoint. |
+| **Cache corruption** | Validate cache headers with checksums; on deserialization failure, log a warning and fall back to a cold build. `rustc` itself follows this pattern: a corrupted incremental cache is reported as a warning, not a hard failure. |
+| **Build script / proc-macro malicious code** | Execute build scripts and proc macros in a sandboxed subprocess with restricted filesystem, network, and syscall access. `sccache`’s distributed compilation model provides a reference for sandboxed compiler execution. |
+| **Hung compilation** | Per-task watchdog with a configurable timeout; kill and report the task. |
+| **File watcher overflow** | Fall back to a full workspace rescan when the event queue overflows or when a bulk change is detected. |
+
+### 3.2 Memory Management
+
+A long-running daemon that caches every query result for an entire workspace will eventually exhaust memory. The production design must include:
+
+- **LRU eviction for query results**: Salsa supports configurable LRU capacities (e.g., `RA_LRU_CAP` in `rust-analyzer`). The daemon should expose per-query-family capacity limits.
+- **Interning with scoped lifetimes**: Prefer scoped interning for types and paths that are only relevant within a single function or module, so they are collected when the query result is evicted.
+- **Revision tracking and garbage collection**: Periodically drop query results from revisions older than N (e.g., 10 edits) unless they are pinned by an active consumer.
+- **Memory-mapped cache files**: For large serialized caches, use `mmap` to avoid loading the entire cache into RAM; deserialize lazily on demand.
+
+### 3.3 Caching and Persistence
+
+- **On-disk query cache**: Serialize the Salsa database using a compact binary format (e.g., `postcard` or `bincode`) with versioned headers.
+- **Content-addressed artifact cache**: Object files and linked artifacts should be keyed by a hash of their inputs (source, flags, compiler version). This enables sharing across branches and worktrees.
+- **Distributed cache integration**: Expose a `sccache`-compatible interface or use `sccache` as a wrapper for codegen subprocesses. `sccache` already supports Rust compilation caching and distributed execution with authentication and sandboxing.
+- **Cache invalidation**: Cache keys must include the compiler version, target triple, feature flags, `RUSTFLAGS`, and Cargo profile. A mismatch should trigger a clean rebuild, not a corrupted artifact.
+
+### 3.4 Observability
+
+A production daemon is only as good as its observability. The minimum instrumentation includes:
+
+- **Structured tracing** using the `tracing` crate: spans for each query execution, file change, codegen task, and subprocess invocation.
+- **Metrics**: Query hit/miss rates, cache sizes, time spent per compilation stage, number of cancelled tasks, memory usage, and file-event latency.
+- **Slow-query log**: Log queries that exceed a threshold (e.g., 100 ms) with their dependency chain, so performance regressions can be diagnosed.
+- **Profiling hooks**: Integrate with `pprof` or `perf` for CPU profiling; expose a `--profile` mode that dumps a flamegraph of query execution.
+
+---
+
+## 4. Integration with the Rust Ecosystem
+
+### 4.1 Cargo and Workspace Awareness
+
+The pre-compiler must understand Cargo workspaces, features, profiles, and build scripts. The recommended approach is to use `cargo metadata` to discover the workspace graph and feed the relevant parts into the Salsa database as inputs. For build scripts, the daemon should either:
+- Execute build scripts in a sandbox and cache their outputs, or
+- Delegate to `cargo` for the initial build-script execution and ingest the resulting environment.
+
+### 4.2 IDE and LSP Compatibility
+
+The daemon should expose an LSP-compatible interface (or be embeddable as an LSP server) so that it can serve as the back-end for VS Code, Neovim, and other editors. This is a natural fit because `rust-analyzer` already speaks LSP and is built on the same Salsa architecture. The pre-compiler can be viewed as an **extension of `rust-analyzer`’s architecture** that adds codegen and hot-patching capabilities.
+
+### 4.3 Hot-Reload Runtime Protocol
+
+For hot-patching, the daemon and the running process must agree on a protocol:
+- The daemon sends a **patch dylib** and a **jump table** mapping.
+- The runtime applies the patch atomically, updating only the jump table and leaving the original binary untouched.
+- The protocol should be versioned and authenticated (especially if the daemon is remote) to prevent arbitrary code injection.
+
+---
+
+## 5. Implementation Roadmap
+
+### Phase 1: Foundation (Weeks 1–8)
+- Build the VFS with file watching, content hashing, and debouncing.
+- Integrate Salsa 3.0 and define input structs for file contents, Cargo metadata, and compiler flags.
+- Implement parsing queries using `rowan`/`ra_ap_syntax`.
+- Expose a minimal CLI/LSP interface for “parse and report syntax errors”.
+
+### Phase 2: Semantic Front-End (Weeks 9–20)
+- Reuse `rust-analyzer`’s name resolution, macro expansion, and type inference crates.
+- Wire them into Salsa as tracked functions.
+- Implement diagnostics as query by-products.
+- Add durability levels and LRU eviction.
+- Benchmark query latency for typical edit operations (single-function edit, multi-file refactor).
+
+### Phase 3: Codegen and Check Mode (Weeks 21–28)
+- Implement a `rustc` subprocess driver for full check and build.
+- Add Cranelift back-end for fast debug codegen (optional but recommended).
+- Implement artifact caching with content-addressed keys.
+- Integrate `mold`/`lld` linker auto-detection.
+- Add sandboxing for build scripts and proc macros.
+
+### Phase 4: Hot-Patching (Weeks 29–36)
+- Integrate Subsecond’s ThinLinking approach (or implement a compatible jump-table mechanism).
+- Support function-level patching for the tip crate.
+- Add automatic fallback to full rebuild for unsupported changes (struct layout, cross-crate).
+- Implement the daemon↔runtime patch protocol.
+
+### Phase 5: Production Hardening (Weeks 37–48)
+- Add persistent caching (Salsa serialization).
+- Implement crash isolation, watchdog, and cache-corruption recovery.
+- Add observability (tracing, metrics, slow-query log).
+- Performance-tune: parallel query execution, query cancellation, memory limits.
+- Conduct adversarial testing: malicious build scripts, corrupted caches, rapid edit storms.
+
+---
+
+## 6. Trade-Offs and Alternatives
+
+| Decision | Recommended | Alternative | Rationale |
+|---|---|---|---|
+| **Query engine** | Salsa 3.0+ | Custom incremental engine | Salsa is proven at scale in `rust-analyzer` and `chalk`; building a custom engine is a multi-year effort. |
+| **Front-end** | Reuse `rust-analyzer` crates | Reimplement | `rust-analyzer`’s front-end is the most mature Salsa-based Rust front-end; reimplementation is unnecessary and risky. |
+| **Codegen** | `rustc` subprocess + Cranelift for debug | Embed `rustc_driver` | Subprocess isolation is essential for production stability; `rustc_private` APIs are unstable. |
+| **Hot-patching** | Subsecond/ThinLinking (function-level) | Dylib full-module reload | Function-level patching preserves state and avoids restarting the process; full-module reload is simpler but loses state. |
+| **Persistence** | Lazy on-disk Salsa serialization | Eager full-database dump | Lazy deserialization minimizes startup time; eager dumps can be large and slow to load. |
+| **Parallelism** | Salsa/Rayon query pool + thread pool | Single-threaded | Parallelism is critical for large workspaces; Salsa’s query model is designed for it. |
+
+---
+
+## 7. Conclusion
+
+The optimal production-grade real-time Rust pre-compiler is a **Salsa-based query daemon** that treats compilation as a live, incremental computation over a virtual file system. It separates **semantic analysis** (fast, in-memory, Salsa-driven) from **code generation** (isolated subprocess, Cranelift or `rustc`, function-level hot-patching), and it is hardened with sandboxing, persistent caching, crash isolation, and comprehensive observability.
+
+The key insight is that the Rust ecosystem already contains the necessary building blocks—`rust-analyzer`’s front-end, Salsa’s incremental engine, Subsecond’s hot-patching, and `mold`/`lld` linkers. The engineering challenge is not inventing new algorithms, but **composing these blocks into a daemon architecture that is correct, resilient, and fast under real editing workloads**. By following the phased roadmap above and prioritizing fault isolation and observability from the outset, a small team can deliver a production-grade system that reduces the Rust edit–compile–run loop from seconds to milliseconds.
+
+"What are the optimal ways to ensure that the Rust real-time pre-compiler is futureproof and can survive and evolve for the next 100+ years to do anything and everything that it needs to?"
+
+Designing a Rust real-time pre-compiler to survive and evolve for a century is less about predicting future hardware or language features and more about **architectural asceticism**: deliberately choosing what must endure versus what can be discarded. The technologies that reach 50–100 years—COBOL, C, SQL, Linux—endure because they are built on open, well-understood foundations and can outlive their original creators and ecosystems. A 100-year pre-compiler must be designed from day one for its own obsolescence at the periphery, while keeping its core semantic contracts permanent.
+
+---
+
+## 1. Architectural Temporal Decoupling: Separate Permanence from Transience
+
+The foundational risk to any long-lived compiler is **structural coupling to a transient implementation detail**. The Legacy-First Design framework calls this the distinction between permanence and transience, and introduces "Survival in Abandoned State" as a core principle: the system must remain coherent and functional long after its original context and creators have vanished.
+
+For the pre-compiler, this translates into a **layered architecture with explicit, versioned contracts between layers**, where each layer can be replaced independently:
+
+| Layer | Permanence | Examples of transient implementations |
+|---|---|---|
+| **Source of truth** | Permanent | The Rust source code and Cargo manifest format (these outlive any tool). |
+| **Semantic model (IR)** | Permanent contract | A formally specified intermediate representation of types, MIR, and diagnostics. |
+| **Incremental computation engine** | Transient behind adapter | Salsa today; a successor tomorrow. The pre-compiler must define its own `IncrementalEngine` trait and treat Salsa as one implementation. |
+| **Parser / front-end** | Transient behind adapter | `ra_ap_*` crates today; a future parser if the ecosystem shifts. The contract is the IR, not the parser's internal AST. |
+| **Codegen back-end** | Transient behind adapter | `rustc` subprocess, Cranelift, or a future verified code generator. The contract is the object-file/patch format. |
+| **Hot-patch protocol** | Permanent specification | A versioned, documented wire format for jump tables and patch dylibs, independent of any serialization library. |
+
+**Critical implication for the Salsa dependency**: Salsa has already been described as "largely defunct" outside `rust-analyzer`, which maintains its own specialized fork. Building the pre-compiler's core abstractions directly on Salsa's API would tie its fate to a single project's maintenance trajectory. Instead, define a minimal incremental computation interface (e.g., `tracked_query`, `input`, `invalidate`) and implement it first with Salsa behind an adapter. When Salsa's successor arrives—or when a future maintainer chooses to vendor or replace it—only the adapter changes. The semantic model and the query graph's *meaning* remain untouched.
+
+---
+
+## 2. Bootstrappable Trust: The Ability to Rebuild from Nothing
+
+A 100-year compiler must be **bootstrappable from source without relying on opaque binaries or a chain of unverifiable pre-built compilers**. The bootstrappable software movement demonstrates that long chains of binary dependencies "may bitrot and break over time" and that trusting a compiler requires the ability to follow the bootstrapping process from a minimal, auditable seed.
+
+For the pre-compiler, this means:
+
+- **Maintain a minimal Stage 0**: The earliest buildable version of the pre-compiler should be compilable by a small, well-understood bootstrap path—ideally a version of the compiler that can be built by a simple C compiler or a tiny self-hosting assembler. GNU Guix's full-source bootstrap begins with a 190-byte `hex0` assembler for exactly this reason.
+- **Preserve old source releases forever**: Every released version of the pre-compiler's source must remain available and buildable on a specified minimal toolchain. The build instructions for version *N* should never require version *N+1* of anything.
+- **Document the bootstrap chain**: Maintain a machine-readable manifest of every tool and version needed to go from bare metal to a working pre-compiler. Future maintainers must be able to reproduce the bootstrap without consulting external tribal knowledge.
+- **Prefer simplicity in the bootstrap path**: The bootstrap compiler does not need to be fast or feature-complete. It needs to be *small enough to audit* and *stable enough to rebuild*.
+
+---
+
+## 3. Formal Specification of Permanent Contracts
+
+Code is ephemeral; **specifications are what survive rewrites**. The pre-compiler should maintain formal or semi-formal specifications for every interface that is intended to be permanent:
+
+- **The intermediate representation (IR)**: Specify the syntax and semantics of the IR in a language-independent document (or a machine-checkable format such as a JSON schema or an SMT-LIB theory). This allows a future maintainer to re-implement the front-end or back-end against the spec, rather than reverse-engineering the current code.
+- **The diagnostic format**: Specify the structure of diagnostics (spans, codes, suggestions) so that tooling built on the pre-compiler in 2126 can parse diagnostics emitted by a 2026 version, and vice versa.
+- **The hot-patch protocol**: Specify the wire format for patch dylibs and jump tables at the byte level. This protocol is likely to outlive any particular runtime or OS.
+
+Formal verification of the entire compiler is impractical and would make the system too rigid. But **lightweight formal methods for the permanent contracts** are feasible and invaluable:
+
+- Use property-based testing and fuzzing to establish that the IR preserves well-typedness and that transformations are semantics-preserving under the specified rules.
+- For the most critical invariant—that the pre-compiler never miscompiles a program—consider **translation validation**: each codegen output is checked by an independent validator against the IR's semantics. This is less costly than verifying the compiler itself and catches errors in any back-end, including future ones.
+
+---
+
+## 4. Data Format Longevity: Design for Human and Machine Readability
+
+Every persistent artifact the pre-compiler produces—caches, serialized query databases, patch dylibs, and protocol messages—must be designed for **re-readability decades later**. The archival data community has long established that the most durable formats are those that are simple, self-describing, and independent of any single toolchain.
+
+| Artifact | Recommended format | Rationale |
+|---|---|---|
+| **Query cache / persistent database** | A versioned, documented binary format with a plain-text schema definition; optionally, a JSON or S-expression representation for debugging and migration. | Binary efficiency for runtime, but the schema must be simple enough to re-implement from a one-page specification. Avoid opaque serialization frameworks whose format may change without notice. |
+| **Configuration and project metadata** | TOML or JSON with explicit version fields and forward-compatible unknown-field handling. | Human-readable, widely supported, and easy to parse in any future language. |
+| **Patch protocol messages** | A length-prefixed binary format with a fixed header, or a text-based format (e.g., JSON) for control messages. | The protocol must be documented independently of the pre-compiler's source code. |
+| **Logs and traces** | Structured JSON or a simple line-based text format. | Future maintainers must be able to analyze historical behavior without running the original software. |
+
+The key discipline is **migration-first design**: every format must have a documented migration path from every prior version. A cache produced by version *X* must either be readable by version *Y* or be explicitly invalidated with a clear, logged reason. Silent corruption or silent incompatibility is unacceptable in a century-scale system.
+
+---
+
+## 5. Ecosystem Independence Through Open Standards and Stable Interfaces
+
+The technologies that survive centuries are those that do not depend on a single vendor, framework, or community. COBOL and SQL endure because they are standardized and implemented by many vendors; Linux endures because it is an open standard in practice. The pre-compiler should follow the same pattern:
+
+- **Editor integration**: Expose the Language Server Protocol (LSP) as the primary editor interface. LSP is an open standard with multiple independent implementations, so the pre-compiler remains useful even if the original editor plugins disappear.
+- **Plugin and extension model**: Define extensions in terms of **WebAssembly** (for sandboxed, portable plugins) or a **stable C ABI** (for performance-critical native extensions). Both are language-agnostic and have multiple independent runtimes. Do not build a proprietary Rust-only plugin system.
+- **Hot-patch runtime integration**: Specify the runtime side of the patch protocol as a **C ABI-compatible interface**. Any future runtime, in any language, can implement the host side of the protocol without linking Rust code.
+- **Build system integration**: Do not depend exclusively on Cargo. Expose a **command-line interface and a stable JSON-RPC or stdio protocol** that any build system (including future ones) can drive.
+
+The underlying principle is **interface substitutability**: any component of the pre-compiler must be replaceable by an independent implementation of its interface, and that interface must be documented as an open specification.
+
+---
+
+## 6. Governance and Community Sustainability: Designing for Abandonment
+
+A 100-year software system will almost certainly outlive its original maintainers, its funding source, and its founding organization. The Legacy-First Design principle of "Survival in Abandoned State" requires the system to remain **coherent and functional when no one is actively maintaining it**. This is an architectural requirement, not merely a social one.
+
+- **Permissive, irrevocable licensing**: Use a license (e.g., MIT/Apache-2.0 dual license) that allows any future individual or organization to fork, maintain, and redistribute the code without legal ambiguity. Avoid licenses that depend on a specific legal entity's continued existence.
+- **Comprehensive architectural decision records (ADRs)**: Every non-obvious design decision must be documented with its context, alternatives, and consequences. Future maintainers must understand *why* the system is the way it is, not just *how* it works.
+- **Literate or deeply documented source**: The source code must be readable as a specification. Critical algorithms (incremental invalidation, macro expansion, type inference) should have accompanying prose explanations. The literate programming tradition, while never a mass standard, demonstrated that explanation alongside code reduces maintenance costs over decades.
+- **Governance that survives individuals**: Establish a lightweight governance model based on written procedures and consensus, not on the authority of specific people. The Rust RFC process is a proven model: a consistent and controlled path for changes that does not depend on any single maintainer.
+- **Periodic "abandonment drills"**: Simulate the loss of key maintainers and infrastructure. Can a new team fork the repository, build the compiler from source, run the test suite, and release a patch without access to the original organization's secrets or services? If not, the system is not designed for abandonment.
+
+---
+
+## 7. Compatibility Strategy: Editions and Semantic Versioning for the Long Term
+
+The pre-compiler must evolve without breaking the code and tooling that depend on it. Rust itself provides a proven model: the **edition system** allows incompatible changes to be introduced on an opt-in basis, so existing code continues to compile indefinitely. The pre-compiler should adopt an analogous strategy for its own interfaces:
+
+- **Public interfaces are versioned with semantic versioning**: A major version bump signals a breaking change; minor versions add functionality; patches fix bugs. But major versions must be rare, and each major version must have a documented migration path and a support window measured in decades, not months.
+- **Capability-based feature detection** is preferable to version-number checks. A consumer should ask "does this compiler support the `incremental_patch_v2` capability?" rather than "is this compiler version ≥ 4.0?".
+- **Long-term support (LTS) releases**: Maintain at least one LTS release of the pre-compiler that receives critical bug and security fixes for an extended period (e.g., 10–20 years). LTS releases should have a minimal dependency surface and be buildable from a stable bootstrap chain.
+
+---
+
+## 8. Portability Abstraction: Target-Agnostic Core, Target-Specific Periphery
+
+A 100-year compiler will encounter hardware architectures and operating systems that do not exist today. The core must be **target-agnostic**:
+
+- **All target-specific code** (ABI details, relocation formats, assembly emission, OS-specific hot-patching mechanisms) must live behind a small, well-defined **target abstraction layer**. Adding a new target should mean implementing this layer, not modifying the front-end or the incremental engine.
+- **The IR and the semantic model must not embed assumptions about pointer width, endianness, or calling conventions**. These are properties of the target, supplied as inputs to the back-end.
+- **The hot-patch protocol must be OS-agnostic in its specification**; only the host-side implementation of memory protection and dynamic loading is OS-specific.
+
+This mirrors the design of GCC and Clang, which have survived multiple hardware generations by isolating target back-ends behind stable internal interfaces.
+
+---
+
+## 9. Verification and Testing as Permanent Assets
+
+A century of evolution demands a **conformance test suite that is independent of any implementation**. The test suite is not merely a quality gate; it is the executable specification of the pre-compiler's behavior.
+
+- **Differential testing across implementations**: Maintain the ability to compare the pre-compiler's output against multiple independent Rust compilers (different `rustc` versions, Cranelift, and future back-ends). Any divergence is either a bug in the pre-compiler or a documented, intentional semantic difference.
+- **Golden tests for permanent formats**: Every serialized format (cache, patch protocol, diagnostics) must have golden-file tests that pin its byte-level or structural representation. These tests must never be changed without a major version bump and a migration path.
+- **Fuzzing and property-based testing as permanent CI**: These are not one-time efforts; they must run continuously for the life of the project. The properties they check (e.g., "type checking terminates," "invalidation is conservative") are the invariants that keep the system correct across rewrites.
+
+---
+
+## 10. The Ultimate Test: Can a Future Team Rebuild It from the Spec?
+
+The single most rigorous future-proofing criterion is this: **Given only the written specifications, the conformance test suite, and a bootstrappable toolchain, can an independent team in 2126 build a functionally equivalent pre-compiler without consulting the original source code?**
+
+If the answer is yes, the system is genuinely future-proof. If the answer is no—because the behavior is encoded only in the source, because the bootstrap chain is broken, or because the interfaces are under-specified—then the system is merely a transient artifact, destined for the same obsolescence as any framework of its era.
+
+The optimal design for 100 years is therefore not the one that anticipates every future feature. It is the one that makes its **permanent contracts explicit, its transient implementations replaceable, its bootstrap path reproducible, and its knowledge independent of its creators**. That is the architecture that survives abandonment and earns the right to evolve for a century.
+
+"What are the optimal next steps for the project?"
+
+The optimal next step for this project is not to write more architecture. It is to **falsify the riskiest architectural assumptions with focused, time-boxed spikes**, and only then commit to the permanent contracts that everything else will depend on.
+
+The research from the previous rounds pointed to a specific composition: Salsa as the incremental engine, `rust-analyzer` as the semantic front-end, and jump-table hot-patching for codegen. Every one of those choices is now backed by a working system in the ecosystem. Your next steps should prove that *your specific composition* works before you invest in production hardening.
+
+---
+
+## 1. Run Three Spikes That Each Test a Load-Bearing Assumption
+
+### Spike A: Prove that `rust-analyzer`'s semantic layer can be driven as a library by an external daemon
+
+**Assumption under test:** You can reuse `rust-analyzer`'s crates (`ra_ap_*`) behind your own `IncrementalEngine` trait without forking or gutting them.
+
+`rust-analyzer` is explicitly designed as a compiler front-end: it performs parsing, lowering, and name resolution up to HIR, and it keeps all input in memory with no IO in the analysis core. It exposes `Analysis` and `AnalysisHost` as the main API for consumers. That API boundary is the insertion point for your daemon.
+
+**What to build (2–3 weeks):**
+- A minimal daemon binary that depends on the `ra_ap_*` crates.
+- A `Change` ingestion path that feeds file contents into `AnalysisHost` and triggers re-analysis.
+- A query that asks for diagnostics on a single file, and a second query that asks for the type of an expression at a byte offset.
+- Measure: time from `Change` applied to diagnostics returned, for a single-function edit in a 10k–50k LOC crate.
+
+**Pass criterion:** Sub-100 ms diagnostics latency for a single-function edit, with no fork of `rust-analyzer` required.
+
+**Why this is the highest-priority spike:** If this fails—if the `ra_ap_*` crates cannot be consumed without pulling in the entire LSP server, or if the API surface forces you to depend on unstable internals—your entire front-end strategy changes. You need to know that in week three, not month nine.
+
+### Spike B: Prove that Salsa's persistent cache survives a daemon restart without correctness loss
+
+**Assumption under test:** Salsa's serialization can transform your cold-start time from a full workspace analysis into a warm query materialization.
+
+`rust-analyzer` migrated to a new version of Salsa and gained *persistent caches* as a direct benefit, alongside parallel autocomplete and near-instant crate graph changes. Salsa is not used directly in `rustc`, but it is used extensively in `rust-analyzer` and in `chalk`—so its production users are exactly the kind of system you are building.
+
+**What to build (2 weeks, can run in parallel with Spike A):**
+- A Salsa database with two input files and a derived query that depends on both.
+- Serialize the database to disk, drop the process, restart, deserialize, and request the derived query.
+- Corrupt one byte of the serialized cache and verify that the daemon falls back to a cold computation with a logged warning rather than panicking or returning wrong results.
+- Measure: cold-start time (no cache) vs. warm-start time (valid cache) vs. recovery time (corrupted cache).
+
+**Pass criterion:** Warm start is at least 5× faster than cold start for a workspace sized to your target, and corrupted caches never produce silent misbehaviour.
+
+### Spike C: Prove that jump-table hot-patching works on a non-Dioxus binary
+
+**Assumption under test:** Subsecond's jump-table architecture is general enough to patch a plain Rust binary that was not built with a framework like Dioxus.
+
+Subsecond implements hot-patching through **jump table indirection**: hot-reloadable functions are called through a global `APP_JUMP_TABLE`, the runtime looks up the function pointer, and applying a patch only updates the jump table while the original executable remains untouched. The patch flow is fully documented: ThinLink compiles only modified functions into a patch dylib, the patch is loaded via `libloading`, the base address is calculated using `main` as an anchor, and the jump table is updated with old→new address mappings. ASLR is handled by having the running process report the real address of `main` and computing the offset on the devserver side.
+
+Critically, `ra-jit` already demonstrates this working on real binaries: a one-function edit in `ripgrep` goes from 453 ms with incremental `cargo build` to **50 ms** with live patching, and a widely used function goes from 724 ms to **37 ms**. The same pattern holds across `fd`, `bat`, `hyperfine`, `just`, `axum`, and `nushell`.
+
+**What to build (3–4 weeks):**
+- Take a small but non-trivial Rust binary (e.g., a CLI tool with 5–10 modules and some shared state).
+- Instrument it with Subsecond's `call()` indirection for the functions you intend to patch.
+- Wire up a minimal patch server: file save → ThinLink compile of the changed function → dylib transfer → `apply_patch`.
+- Measure: edit-to-execution latency, and whether program state survives across patches.
+
+**Pass criterion:** A one-function edit is live in the running binary in under 100 ms, with observable state preserved across the patch.
+
+**What to document from this spike:** Subsecond's documented limitations are real and will affect your product design. Struct changes are not supported (size/alignment changes crash the process); only the tip crate is patched (library crates are ignored); static initializers in new patches are not observed; and newly added globals have destructors that never run. Your daemon must detect these cases and fall back to a full rebuild *before* applying a patch that would crash the user's process.
+
+---
+
+## 2. In Parallel: Write the Permanent Contracts, Not the Code
+
+While the spikes run, the architectural work that should proceed is **specification**, not implementation. The 100-year survival criterion from the previous round was: can an independent team rebuild this from the spec alone? Start earning that now.
+
+The three contracts to write first, in order of urgency:
+
+### 2.1 The `IncrementalEngine` trait
+
+This is the boundary that keeps Salsa replaceable. Define it in terms of inputs, queries, invalidation, and cancellation—not in terms of Salsa's `#[salsa::tracked]` macros. The contract should answer:
+
+- What is an input, and how is it mutated?
+- What is a derived query, and what is its identity?
+- How does cancellation propagate?
+- How are query results persisted and restored?
+
+Then implement it with Salsa behind an adapter. If Salsa's successor arrives in five years, or if a future maintainer chooses to vendor Salsa, only the adapter changes.
+
+### 2.2 The diagnostic format
+
+Specify the structure of a diagnostic—spans (file, byte range), severity, code, message, and suggested fixes—in a language-independent schema. This is what tooling built on your daemon will consume for decades. It should be stable enough that a 2126 editor can parse diagnostics emitted by a 2026 daemon.
+
+### 2.3 The hot-patch protocol
+
+Specify the wire format for patch dylibs and jump-table mappings at the byte level. The protocol should be documented independently of Subsecond's implementation, so that a future runtime in any language can implement the host side without linking Rust code. Include the handshake for ASLR reference exchange, the patch-application sequence, and the version negotiation.
+
+---
+
+## 3. Establish the Security Boundary Before Codegen
+
+The spikes will tell you whether the semantic and codegen paths work. The security boundary is the one piece of production hardening that cannot be retrofitted cheaply, because it constrains how the codegen subprocess is invoked and how build scripts and proc macros are executed.
+
+The risk is concrete: proc macros are Rust programs that run at compile time **with the full privileges of whoever invoked `cargo build`**, in the compiler's process, with no sandbox by default. They can read `~/.ssh/authorized_keys`, exfiltrate `GITHUB_TOKEN` and cloud credentials from CI environments, inject backdoor code into the emitted token stream, and phone home with build telemetry—all before the compilation you think of as "the build" has begun. Unlike `build.rs`, which is visible in the crate root, a proc macro three transitive hops away runs on your CI without anyone in your organisation having looked at it.
+
+**The minimum viable security design:**
+
+- **Codegen runs in a subprocess**, never in-process. An ICE in `rustc` or a crash in Cranelift kills only the subprocess, not the daemon.
+- **Proc macros and build scripts execute in a sandboxed subprocess** with restricted filesystem, network, and syscall access. The Rust Foundation's Google Summer of Code work on **sandboxed and deterministic proc macros using Wasm** is the reference direction: compile the proc macro to Wasm and execute it in a Wasm runtime with a curated host interface.
+- **The patch dylib is treated as untrusted input** on the runtime side until it has been validated against the expected symbol table and jump-table shape. A malicious or corrupted patch must not be able to redirect execution arbitrarily.
+
+Document this boundary in an ADR *before* you build the codegen path, so that every subsequent decision respects it.
+
+---
+
+## 4. What Not to Build (Yet)
+
+The temptation with a project of this scope is to build the full daemon, the full front-end, the full codegen pipeline, and the production hardening layer in parallel. Resist it. Specifically:
+
+- **Do not build a custom parser or front-end.** `rust-analyzer`'s front-end is the most mature Salsa-based Rust front-end in existence, and Spike A will tell you whether it is consumable. Reimplementing it is a multi-year effort with no strategic payoff.
+- **Do not embed `rustc_driver`.** The `rustc_private` APIs are unstable, and an ICE in-process kills your daemon. Use a subprocess, and use `rustd`'s pattern as a reference: it is explicitly a drop-in `cargo`/`rustc` replacement that keeps `rust-analyzer`'s analysis in memory, compiles changed functions with Cranelift or LLVM, and links them in front of what `rustc` built. Note that `rustd` is an early prototype with no borrow checker and a pinned toolchain—it is a pattern reference, not a dependency.
+- **Do not build the full hot-patch runtime for all platforms.** Subsecond already supports Linux, macOS, and Windows on x86_64 and aarch64, Android and iOS Simulator, and limited WASM32 module reloading. Your job is the daemon-side orchestration and the safety checks that prevent unsupported patches, not a from-scratch runtime.
+- **Do not commit to Cranelift for all debug builds until you have measured it in your pipeline.** Cranelift is distributed as a rustup component on nightly builds and is designed to improve debug-mode compilation times. It is a strong candidate for the fast codegen path, but the decision should follow a measurement of your actual edit–patch loop, not precede it.
+
+---
+
+## 5. Sequence and Decision Gates
+
+| Phase | Duration | Work | Gate to proceed |
+|---|---|---|---|
+| **Spikes** | Weeks 1–4 | Spike A (semantic layer), Spike B (Salsa persistence), Spike C (hot-patching) | All three pass criteria met, or the failing spike has a documented pivot |
+| **Contracts** | Weeks 1–6 (parallel) | `IncrementalEngine` trait, diagnostic schema, patch protocol spec, security ADR | An independent engineer can implement a mock against each contract without reading the spike code |
+| **Integration** | Weeks 5–10 | Wire the real Salsa adapter and the `ra_ap_*` front-end behind the contracts; connect the hot-patch path to the codegen subprocess | End-to-end: save file → diagnostics in <100 ms → patch applied in <100 ms on the spike binary |
+| **Safety layer** | Weeks 9–14 | Unsupported-change detection (struct layout, cross-crate, static initializers), automatic fallback to full rebuild, sandboxed proc-macro execution | No patch that Subsecond documents as unsupported can reach the runtime |
+| **Production hardening** | Weeks 15+ | Crash isolation, cache corruption recovery, observability (tracing, metrics, slow-query log), memory limits, bootstrappable build chain | The daemon survives an ICE, a corrupted cache, and an edit storm without losing correctness |
+
+The single most important discipline is this: **the spikes are the next step, not the architecture document.** The architecture is already specific enough to be falsifiable. Every week spent refining it further is a week not spent discovering which of its assumptions is wrong. Run the spikes, write the contracts they validate, and let the measurements—not the prose—decide what gets built next.
+
+"Create a README, PLA.md, TODO.md AGENTS.md, and other other docs and handover documentation to ensure that the agent building the project does so seamlessly as effectively and efficiently as possible"
+
+Below is a complete, production-ready documentation scaffold for the project. It is designed so that an AI agent can drop into the repository, read `AGENTS.md` first, run the exact commands it specifies, and execute the plan without reverse-engineering intent from chat history.
+
+The architecture and next steps are drawn from the previous rounds of this conversation. The documentation formats follow current ecosystem standards: `AGENTS.md` as the cross-tool agent contract (60,000+ projects, stewarded by the Agentic AI Foundation at the Linux Foundation), `PLAN.md` as the durable “waves and parts” execution record, `ADR` files in `docs/adr/` using the Nygard template, and a handover structure that captures status, decisions, gotchas, and open work.
+
+---
+
+# README.md
+
+```markdown
+# Real-Time Rust Pre-Compiler
+
+A persistent, query-driven compilation daemon for Rust that keeps a live
+semantic model of the workspace in memory and incrementally produces
+diagnostics, checked artifacts, and hot-patchable code in real time.
+
+**Status:** Pre-alpha — architectural spikes in progress.
+
+## What It Does
+
+Traditional Rust compilation is a batch process: edit, wait, build, repeat.
+This project treats compilation as a continuous, incremental computation over a
+virtual file system. It separates two concerns:
+
+- **Semantic front-end** — parsing, name resolution, type inference, and
+  diagnostics, served from an in-memory Salsa query database with
+  sub-100 ms latency for a single-function edit.
+- **Codegen back-end** — isolated compilation of changed functions into patch
+  dynamic libraries, applied to a running process through jump-table
+  indirection, with automatic fallback to a full rebuild when a change is
+  unsupported.
+
+The goal is to reduce the Rust edit–compile–run loop from seconds to
+milliseconds without sacrificing correctness.
+
+## Documentation Map
+
+| File | Purpose |
+|---|---|
+| [`AGENTS.md`](AGENTS.md) | **Start here.** Build/test commands, code rules, boundaries. |
+| [`PLAN.md`](PLAN.md) | Execution waves, parts, owners, and status. |
+| [`TODO.md`](TODO.md) | Flat, prioritized task list mirrored from PLAN.md. |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layered system design and crate map. |
+| [`docs/adr/`](docs/adr/) | Architectural Decision Records (Nygard format). |
+| [`docs/handover/HANDOVER.md`](docs/handover/HANDOVER.md) | Session-to-session handover record. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Commit, review, and style conventions. |
+| [`SECURITY.md`](SECURITY.md) | Threat model, sandboxing policy, disclosure. |
+
+## Quick Start
+
+```bash
+# Toolchain is pinned in rust-toolchain.toml.
+rustup show
+
+# Build the workspace.
+cargo build --workspace --all-targets
+
+# Run the full test suite.
+cargo nextest run --workspace
+
+# Run the daemon against the sample workspace.
+cargo run -p rpc-daemon -- --workspace fixtures/sample-workspace
+```
+
+## Design Principles
+
+1. **The spikes are the plan.** No architecture is accepted until a
+   time-boxed spike has falsified its riskiest assumption. See `PLAN.md`.
+2. **Subprocess isolation for codegen.** `rustc` is never linked into the
+   daemon. An ICE kills a subprocess, not the daemon.
+3. **Contracts before code.** `IncrementalEngine`, the diagnostic schema, and
+   the patch protocol are specified before their implementations.
+4. **Salsa is replaceable.** The core depends on an adapter trait, not on
+   Salsa's macros.
+5. **Unsupported patches never reach the runtime.** Struct-layout changes,
+   cross-crate edits, and static-initializer changes trigger a full rebuild
+   before a patch is sent.
+
+## License
+
+MIT OR Apache-2.0, at your option. See [`LICENSE-MIT`](LICENSE-MIT) and
+[`LICENSE-APACHE`](LICENSE-APACHE).
+```
+
+---
+
+# AGENTS.md
+
+```markdown
+# AGENTS.md
+
+This file is the agent contract for the repository. Read it before every
+session. It overrides defaults. Keep the root file short; put area-specific
+instructions in nested `AGENTS.md` files (the nearest file wins).
+
+## Project Summary
+
+A persistent, query-driven Rust compilation daemon. Semantic front-end on
+Salsa; codegen in an isolated subprocess; hot-patching through jump-table
+indirection. Correctness and crash isolation are non-negotiable.
+
+## Commands
+
+Run these exactly. Do not invent alternate invocations.
+
+```bash
+# Format
+cargo fmt --all -- --check
+
+# Lint (deny warnings)
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Build
+cargo build --workspace --all-targets
+
+# Test (preferred runner)
+cargo nextest run --workspace
+
+# Test (fallback if nextest is unavailable)
+cargo test --workspace
+
+# Docs
+cargo doc --workspace --no-deps
+```
+
+**Before declaring any task done, you must run format, clippy, and the full
+test suite and fix every failure.** Do not commit with warnings or ignored
+tests unless the task explicitly says to.
+
+## Code Rules
+
+- **No panics in library crates.** Return `Result` for fallible operations.
+  `unwrap()` and `expect()` are permitted only in tests and binaries, and
+  only with a comment explaining why the invariant holds.
+- **Every public item has a doc comment.** Include an example for anything
+  non-trivial.
+- **Prefer borrowing over cloning** in query results; use `Arc` only where
+  sharing is genuinely required.
+- **Do not use `unsafe` without an ADR and a `// SAFETY:` comment.**
+- **Do not add a dependency without an ADR.** A dependency is a long-term
+  liability in a project designed to outlive its ecosystem.
+- **Never modify generated files** (`target/`, generated protocol bindings).
+
+## Testing Rules
+
+- New behavior requires a test that fails before the change and passes after.
+- Query logic must have a property-based test or a documented reason why not.
+- Every serialized format (cache, patch protocol, diagnostics) requires a
+  golden-file test.
+- Do not mock the Salsa database in integration tests; use a real `TestDB`.
+
+## Boundaries
+
+Never touch without explicit instruction:
+
+- `rust-toolchain.toml` (toolchain pin)
+- `Cargo.lock` (except via `cargo update` when the task requires it)
+- `docs/adr/` (ADRs are append-only; supersede, do not edit)
+- `.github/workflows/` (CI is a gate, not a convenience)
+
+Ask before:
+
+- Adding a crate to the workspace
+- Changing a public trait in `rpc-core`
+- Changing the patch protocol version
+
+## Commit and PR Rules
+
+- Conventional Commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`,
+  `chore:`. Scope is the crate name.
+- One logical change per commit.
+- PR description must link the `PLAN.md` part ID (e.g. `F1`, `B3`).
+- PRs that change architecture require a new ADR in the same PR.
+
+## Where to Look
+
+1. `PLAN.md` — what wave we are in and which part is next.
+2. `TODO.md` — the flat task list.
+3. `ARCHITECTURE.md` — crate boundaries and data flow.
+4. `docs/adr/` — why the system is the way it is.
+5. `docs/handover/HANDOVER.md` — what the previous session did and what is
+   still in flight.
+```
+
+---
+
+# PLAN.md
+
+```markdown
+# Plan: Real-Time Rust Pre-Compiler
+
+Documents: README.md, ARCHITECTURE.md, docs/adr/, TODO.md
+Updated: 2026-10-29 (initial)
+
+## Wave 0: Foundation and Contracts (Weeks 1–4)
+
+| Part | Agent | Scope | Owns | Reads | Done when | Status |
+|---|---|---|---|---|---|---|
+| F1 | core | Workspace scaffold; pin toolchain; set up CI gates | `Cargo.toml`, `rust-toolchain.toml`, `.github/workflows/` | AGENTS.md | `cargo build`, `clippy`, and `nextest` pass on an empty workspace | planned |
+| F2 | core | Define `IncrementalEngine` trait and Salsa adapter skeleton | `crates/rpc-core/src/engine/` | ARCHITECTURE.md | Trait compiles; a mock adapter passes a smoke test | planned |
+| F3 | core | Define diagnostic schema (versioned, language-independent) | `crates/rpc-diagnostics/` | ADR-0002 | Schema serialized and round-tripped in a golden test | planned |
+| F4 | core | Define hot-patch protocol spec (byte-level) | `docs/specs/patch-protocol-v1.md` | ADR-0003 | An independent mock host can parse the control messages | planned |
+| F5 | security | Write the sandboxing ADR before any codegen code | `docs/adr/0004-sandboxing.md` | SECURITY.md | ADR accepted; boundary is explicit | planned |
+
+## Wave 1: Spikes (Weeks 1–4, parallel with Wave 0)
+
+| Part | Agent | Scope | Owns | Reads | Done when | Status |
+|---|---|---|---|---|---|---|
+| S1 | frontend | Consume `ra_ap_*` crates as a library; drive `AnalysisHost` from a daemon | `spikes/s1-ra-driver/` | ARCHITECTURE.md, ADR-0001 | Sub-100 ms diagnostics for a single-function edit in a 10k–50k LOC crate | planned |
+| S2 | core | Salsa persistence: serialize, restart, deserialize, corrupt one byte | `spikes/s2-salsa-persist/` | ADR-0001 | Warm start ≥ 5× cold start; corrupted cache recovers without silent error | planned |
+| S3 | codegen | Jump-table hot-patching on a non-Dioxus binary | `spikes/s3-hotpatch/` | ADR-0003 | One-function edit live in < 100 ms with state preserved | planned |
+
+## Wave 2: Integration (Weeks 5–10)
+
+| Part | Agent | Scope | Owns | Reads | Done when | Status |
+|---|---|---|---|---|---|---|
+| I1 | core | Wire the real Salsa adapter behind `IncrementalEngine` | `crates/rpc-core/src/engine/salsa/` | F2, S2 | Adapter passes the same smoke test as the mock | planned |
+| I2 | frontend | Wire `ra_ap_*` behind the semantic front-end contract | `crates/rpc-frontend/` | S1 | Diagnostics served through the daemon API | planned |
+| I3 | codegen | Connect the codegen subprocess to the hot-patch path | `crates/rpc-codegen/` | S3, F4 | Save → diagnostics → patch applied, end to end | planned |
+| I4 | core | Unsupported-change detection and fallback | `crates/rpc-codegen/src/guard/` | ADR-0003 | No unsupported patch reaches the runtime in tests | planned |
+
+## Wave 3: Hardening (Weeks 11–16)
+
+| Part | Agent | Scope | Owns | Reads | Done when | Status |
+|---|---|---|---|---|---|---|
+| H1 | core | Crash isolation and watchdog for the codegen subprocess | `crates/rpc-codegen/src/process/` | ADR-0004 | An induced ICE leaves the daemon running | planned |
+| H2 | security | Sandboxed proc-macro execution | `crates/rpc-sandbox/` | ADR-0004 | A malicious proc macro cannot read `~/.ssh` or open a socket | planned |
+| H3 | core | Persistent cache with migration and corruption recovery | `crates/rpc-cache/` | F3, S2 | Cache round-trips across versions with a documented migration path | planned |
+| H4 | observability | Tracing, metrics, slow-query log | `crates/rpc-daemon/src/telemetry/` | — | A slow query is identifiable from the logs alone | planned |
+
+## Risks
+
+- **S1 may fail if `ra_ap_*` cannot be consumed without the full LSP server.**
+  Mitigation: time-box to three weeks; if it fails, pivot to a vendored fork
+  and record the decision in an ADR.
+- **S3 may fail for binaries with complex global state.** Mitigation: choose a
+  CLI binary with shared state as the spike target, not a toy.
+- **Salsa’s persistence format may change.** Mitigation: the adapter trait
+  isolates the rest of the system; the cache is versioned and invalidated on
+  mismatch.
+
+## Log
+
+- 2026-10-29: Initial plan written. No parts started.
+```
+
+---
+
+# TODO.md
+
+```markdown
+# TODO
+
+Mirror of `PLAN.md`. The plan is the source of truth; this file is the flat
+list an agent reads at the start of a session. Promote items from the Backlog
+only when they enter a wave.
+
+## P0 — Blocking the first integration
+
+- [ ] F1: Workspace scaffold and CI gates
+- [ ] F2: `IncrementalEngine` trait and mock adapter
+- [ ] F3: Diagnostic schema and golden test
+- [ ] S1: `ra_ap_*` library consumption spike
+- [ ] S2: Salsa persistence spike
+- [ ] S3: Hot-patch spike on a real binary
+
+## P1 — This wave, after the spikes pass
+
+- [ ] F4: Hot-patch protocol spec
+- [ ] F5: Sandboxing ADR
+- [ ] I1: Real Salsa adapter
+- [ ] I2: Semantic front-end wiring
+- [ ] I3: End-to-end codegen and patch path
+- [ ] I4: Unsupported-change guard
+
+## P2 — Hardening, next wave
+
+- [ ] H1: Subprocess crash isolation
+- [ ] H2: Sandboxed proc macros
+- [ ] H3: Persistent cache and migration
+- [ ] H4: Observability
+
+## Backlog — captured, not committed
+
+- [ ] Bootstrap chain documentation (Stage 0 → Stage 1 → Stage 2)
+- [ ] `mold`/`lld` auto-detection in the codegen subprocess
+- [ ] Cranelift debug-codegen measurement spike
+- [ ] LSP adapter over the daemon API
+- [ ] Distributed cache (`sccache`-compatible) interface
+- [ ] Governance and LTS policy document
+```
+
+---
+
+# ARCHITECTURE.md
+
+```markdown
+# Architecture
+
+## Overview
+
+The pre-compiler is a daemon composed of four layers, each behind an explicit
+contract so that implementations can be replaced without changing the layers
+around them.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ORCHESTRATOR                                               │
+│  priority lanes · debouncing · cancellation · backpressure  │
+├─────────────────────────────────────────────────────────────┤
+│  SEMANTIC FRONT-END          │  CODEGEN BACK-END             │
+│  Salsa query DB              │  isolated subprocess          │
+│  (ra_ap_* behind adapter)    │  (rustc / Cranelift)          │
+├──────────────────────────────┴──────────────────────────────┤
+│  VFS + CHANGE COALESCER                                     │
+│  hashing · debouncing · bulk apply                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Crates
+
+| Crate | Responsibility | Must not depend on |
+|---|---|---|
+| `rpc-core` | `IncrementalEngine` trait, query identity, cancellation | Salsa (directly) |
+| `rpc-vfs` | Virtual file system, hashing, change packs | Any compiler front-end |
+| `rpc-frontend` | `ra_ap_*` wiring, diagnostics production | Codegen |
+| `rpc-diagnostics` | Versioned diagnostic schema | Any implementation detail |
+| `rpc-codegen` | Subprocess driver, guard, artifact cache | The daemon event loop |
+| `rpc-sandbox` | Proc-macro and build-script isolation | Codegen logic |
+| `rpc-daemon` | Orchestrator, scheduling, telemetry, API | Compiler internals |
+| `rpc-cache` | Persistent serialization and migration | Salsa's concrete types |
+
+## Query Layers
+
+The Salsa database follows `rust-analyzer`'s layered model: inputs first, then
+parsing, macro expansion, interning, name resolution, and type inference
+[cite:13]. Each layer is a separate query-group trait; no query in a higher
+layer reaches into a lower layer's internals.
+
+## Contracts
+
+1. **`IncrementalEngine`** — inputs, derived queries, invalidation,
+   cancellation, persistence. Salsa is one implementation.
+2. **Diagnostic schema** — spans, severity, code, message, suggestions. The
+   schema is the public interface, not the Rust types that produce it.
+3. **Patch protocol v1** — control messages, dylib framing, jump-table
+   mapping, ASLR handshake. Specified in `docs/specs/`.
+
+## Data Flow (single edit)
+
+1. File watcher emits an event; VFS reads the file and compares content hashes.
+2. The change pack is applied to the `IncrementalEngine`.
+3. The orchestrator schedules a high-priority diagnostics query and a
+   medium-priority codegen task.
+4. The front-end produces diagnostics from the Salsa graph.
+5. The codegen guard checks whether the change is patchable. If not, it
+   schedules a full rebuild. If yes, it invokes the subprocess and applies
+   the patch through the protocol.
+
+## Non-Goals
+
+- Reimplementing the Rust front-end.
+- Linking `rustc_driver` into the daemon process.
+- Supporting struct-layout changes through hot-patching.
+```
+
+---
+
+# docs/adr/0001-incremental-engine-adapter.md (ADR template + first ADR)
+
+```markdown
+# ADR-0001: Use an Incremental-Engine Adapter Around Salsa
+
+## Status
+Accepted
+
+## Date
+2026-10-29
+
+## Context
+Salsa is the proven incremental computation engine behind `rust-analyzer`
+[cite:5]. It provides memoized queries, durability levels, parallel execution,
+and (in recent versions) serialization. However, Salsa has been described as
+largely maintained for `rust-analyzer`'s needs, and a century-scale project
+cannot bind its core abstractions to a single implementation's API.
+
+## Decision
+Define a minimal `IncrementalEngine` trait in `rpc-core` covering inputs,
+derived queries, invalidation, cancellation, and persistence. Implement it
+first with Salsa in `rpc-core/src/engine/salsa/`. No type from `salsa` appears
+in the public API of `rpc-core`.
+
+## Consequences
+- **Positive:** Salsa can be replaced or vendored without touching the
+  front-end, codegen, or orchestrator. The contract is testable with a mock.
+- **Negative:** A thin adapter adds a small amount of boilerplate and may
+  hide Salsa features that do not fit the trait; those features require an
+  ADR amendment rather than direct use.
+- **Mitigation:** The adapter is intentionally thin; the trait is revisited
+  after the S1 and S2 spikes.
+
+## Alternatives Considered
+- **Use Salsa directly everywhere.** Rejected: couples the project's fate to
+  one crate's maintenance trajectory.
+- **Build a custom incremental engine.** Rejected: multi-year effort with no
+  strategic payoff.
+
+## References
+- Salsa crate documentation; `rust-analyzer` database architecture.
+```
+
+---
+
+# docs/specs/patch-protocol-v1.md (spec stub)
+
+```markdown
+# Hot-Patch Protocol v1
+
+Status: Draft
+Supersedes: none
+
+## Scope
+Defines the wire format between the pre-compiler daemon (sender) and a running
+Rust process (host) for function-level hot-patching.
+
+## Non-Goals
+- Struct-layout changes.
+- Cross-crate patching (only the tip crate is patchable in v1).
+- Static-initializer observation.
+
+## Messages
+
+All integers are little-endian. All lengths are `u32` byte counts.
+
+### `Hello`
+| Field | Type | Description |
+|---|---|---|
+| magic | `[u8; 4]` | `RPPC` |
+| version | `u16` | Protocol version (1) |
+| main_addr | `u64` | Address of `main` in the host, for ASLR offset |
+
+### `PatchOffer`
+| Field | Type | Description |
+|---|---|---|
+| patch_id | `u64` | Monotonic identifier |
+| dylib_len | `u32` | Length of the following dylib bytes |
+| dylib | `[u8; dylib_len]` | The ThinLink patch dylib |
+| map_len | `u32` | Number of old→new address pairs |
+| map | `[(u64, u64); map_len]` | Jump-table update |
+
+### `PatchResult`
+| Field | Type | Description |
+|---|---|---|
+| patch_id | `u64` | Echoed identifier |
+| status | `u8` | 0 = applied, 1 = rejected, 2 = error |
+| detail_len | `u32` | Length of a UTF-8 diagnostic |
+
+## Sequence
+
+1. Host sends `Hello` on startup and on request.
+2. Daemon sends `PatchOffer`; host validates the dylib symbol table and the
+   map shape against the expected jump-table layout.
+3. Host applies the map atomically and replies `PatchResult`.
+4. On any validation failure, the host rejects the patch and the daemon falls
+   back to a full rebuild.
+
+## Security
+
+The host treats the dylib as untrusted until the symbol-table validation
+passes. The daemon treats the host's `main_addr` as untrusted for offset
+computation only; it never dereferences it directly.
+```
+
+---
+
+# CONTRIBUTING.md
+
+```markdown
+# Contributing
+
+## Commit Conventions
+
+Conventional Commits, scoped by crate:
+
+```
+feat(rpc-core): add cancellation hook to IncrementalEngine
+fix(rpc-vfs): suppress duplicate events on atomic save
+docs(adr): record Salsa adapter decision
+```
+
+One logical change per commit. The first line is imperative and under 72
+characters. The body explains *why*, not *what*.
+
+## Code Style
+
+- `cargo fmt` is the formatter; no manual formatting debates.
+- Clippy with `-D warnings`. Pedantic and nursery lint groups are enabled in
+  `Cargo.toml`; exceptions require a `#[allow]` with a reason.
+- Public items are documented. Examples compile (doc tests).
+- `unsafe` requires an ADR and a `// SAFETY:` comment.
+
+## Review
+
+Every PR requires one review. Architecture changes require a new ADR in the
+same PR. The reviewer checks:
+
+1. Does the change match a `PLAN.md` part?
+2. Are the tests real, or do they mock the thing under test?
+3. Does it introduce a dependency without an ADR?
+4. Does it change a serialized format without a version bump and migration?
+
+## Documentation
+
+- `README.md` is for newcomers.
+- `AGENTS.md` is for agents; keep it operational, not narrative.
+- `ARCHITECTURE.md` is stable; update it only when crate boundaries change.
+- ADRs are append-only; supersede, never edit.
+```
+
+---
+
+# SECURITY.md
+
+```markdown
+# Security Policy
+
+## Supported Versions
+
+| Version | Supported |
+|---|---|
+| 0.1.x (pre-alpha) | Security fixes only |
+
+## Reporting a Vulnerability
+
+Open a private security advisory on the repository host. Do not open a public
+issue. Include a minimal reproduction, the affected crate, and the impact.
+
+## Threat Model
+
+The pre-compiler executes untrusted code at two points:
+
+1. **Proc macros and build scripts** run at compile time with the privileges
+   of the invoking user. A proc macro three transitive hops away can read
+   `~/.ssh`, exfiltrate CI tokens, or inject backdoor code into the emitted
+   token stream.
+2. **Patch dylibs** are loaded into a running process. A malicious or
+   corrupted dylib can redirect execution arbitrarily.
+
+### Mitigations (required)
+
+- Proc macros and build scripts execute in a sandboxed subprocess with
+  restricted filesystem, network, and syscall access (see ADR-0004).
+- Codegen runs in a subprocess; an ICE or crash never takes down the daemon.
+- Patch dylibs are validated against the expected symbol table and jump-table
+  shape before the host applies them.
+- The patch protocol is versioned and authenticated when the daemon is remote.
+
+## Out of Scope (v1)
+
+- An attacker with local code-execution privileges on the developer machine.
+- A compromised Rust toolchain.
+- Supply-chain attacks on crates.io dependencies (tracked separately via
+  `cargo audit`).
+```
+
+---
+
+# docs/handover/HANDOVER.md
+
+```markdown
+# Handover — 2026-10-29
+
+## Status Snapshot
+Pre-alpha. Documentation scaffold is in place; no implementation parts have
+started. The immediate next action is Wave 0, Part F1 (workspace scaffold) and
+the three spikes (S1, S2, S3) in parallel.
+
+## What Was Done
+- Wrote `README.md`, `AGENTS.md`, `PLAN.md`, `TODO.md`, `ARCHITECTURE.md`,
+  `CONTRIBUTING.md`, `SECURITY.md`.
+- Wrote ADR-0001 (incremental-engine adapter) and the draft patch protocol v1.
+- Defined the four-wave plan: foundation/contracts, spikes, integration,
+  hardening.
+
+## Decisions Made
+
+| Decision | Rationale | Alternatives Considered |
+|---|---|---|
+| Salsa behind an `IncrementalEngine` adapter | Keeps Salsa replaceable; the contract survives the crate | Direct Salsa use; custom engine |
+| Codegen in a subprocess, never `rustc_driver` in-process | Crash isolation; unstable `rustc_private` APIs | Embed `rustc_driver` |
+| Hot-patching via jump-table indirection | Preserves process state; Subsecond/ra-jit demonstrate <100 ms | Full-module dylib reload |
+| Spikes before integration | Falsify the riskiest assumptions in weeks 1–4, not month 9 | Build the full daemon first |
+
+## Current State
+- No code exists yet. The workspace layout in `ARCHITECTURE.md` is the target.
+- The spikes are the gate: if S1, S2, or S3 fails, the plan is revised *before*
+  Wave 2 begins.
+
+## Open TODOs
+- [ ] **P0** — F1: scaffold the workspace and CI gates
+- [ ] **P0** — S1: `ra_ap_*` library consumption spike
+- [ ] **P0** — S2: Salsa persistence and corruption-recovery spike
+- [ ] **P0** — S3: hot-patch spike on a real CLI binary
+
+## Gotchas & Context
+- **Do not link `rustc_driver` into the daemon.** The `rustc_private` APIs are
+  unstable and an ICE in-process kills the daemon. Use a subprocess.
+- **Subsecond’s documented limits are real:** struct-layout changes are
+  unsupported; only the tip crate is patchable; static initializers in new
+  patches are not observed. The guard in Part I4 must detect these before a
+  patch is sent.
+- **`ra_ap_*` crates may pull in more than expected.** S1 is time-boxed to
+  three weeks for this reason; if it fails, pivot to a vendored fork and
+  record the decision in an ADR.
+- **Corrupted caches must degrade, not crash.** S2’s corruption test is a
+  pass/fail gate, not a nice-to-have.
+
+## Suggested Skills for the Next Agent
+- `salsa` — query design and durability levels.
+- `rust-analyzer-architecture` — six-layer database hierarchy.
+- `subsecond-hotpatch` — jump-table and ThinLinking mechanics.
+```
+
+---
+
+# docs/adr/template.md
+
+```markdown
+# ADR-NNNN: Title
+
+## Status
+Proposed | Accepted | Rejected | Superseded by ADR-NNNN | Amended
+
+## Date
+YYYY-MM-DD
+
+## Context
+The problem, the forces at play, and the relevant background.
+
+## Decision
+What was decided, stated in the active voice.
+
+## Consequences
+### Positive
+### Negative
+### Mitigation
+
+## Alternatives Considered
+- **Alternative:** Pros and cons; why rejected.
+
+## References
+- Links to spikes, specifications, or prior art.
+```
+
+---
+
+## How these files work together
+
+An agent landing in the repository reads `AGENTS.md` first. That file tells it the exact commands to run, the rules it must not break, and the boundaries it must not cross. It points to `PLAN.md` for the current wave and `TODO.md` for the flat task list. When the agent needs to understand *why* a crate exists or *why* a dependency is absent, it reads `ARCHITECTURE.md` and the relevant ADR. When a session ends, it appends to `docs/handover/HANDOVER.md` so the next session starts from a written record, not from memory.
+
+The documentation deliberately keeps `AGENTS.md` near the recommended 20–30 line operational core and pushes narrative into `ARCHITECTURE.md` and ADRs, because content duplicated from the README measurably hurts agent performance. The `PLAN.md` uses the “waves and parts” table structure that makes ownership, scope, and done-when criteria explicit, and the handover follows the status/decisions/gotchas structure that preserves the tribal knowledge most likely to waste a new agent’s time.

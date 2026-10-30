@@ -1,0 +1,26 @@
+# Build artifacts
+/target/
+
+# Cargo target dir (configured in .cargo/config.toml)
+X:/cargo-target/
+
+# Verification artifacts (generated during F1 gate runs)
+/build.txt
+/clippy.txt
+/clippy_daemon.txt
+/clippy_final.txt
+/clippy_ws.txt
+/core_clippy.txt
+/daemon_clippy.txt
+/fmt.txt
+/test.txt
+/test_final.txt
+/test_ws.txt
+
+# IDE
+.idea/
+*.swp
+.DS_Store
+
+# Cargo.lock (optional for a library workspace)
+Cargo.lock

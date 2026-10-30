@@ -1,0 +1,11 @@
+[package]
+name = "rpc-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Isolated, watchdog-guarded codegen subprocess driver."
+
+[dependencies]
+thiserror = "2.0"

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "code": "E0308",
+  "severity": "error",
+  "message": "mismatched types",
+  "spans": [
+    {
+      "file": "src/main.rs",
+      "start": 10,
+      "end": 11
+    }
+  ],
+  "suggestions": [
+    {
+      "description": "consider adding a semicolon",
+      "span": {
+        "file": "src/main.rs",
+        "start": 10,
+        "end": 11
+      },
+      "replacement": ";"
+    }
+  ]
+}

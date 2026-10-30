@@ -1,0 +1,19 @@
+[package]
+name = "rpc-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Real-time Rust pre-compiler: rpc-daemon binary."
+default-run = "rpc-daemon"
+
+[[bin]]
+name = "rpc-daemon"
+path = "src/main.rs"
+
+[dependencies]
+rpc-core = { path = "../rpc-core" }
+serde = { workspace = true }
+serde_json = "1.0"
+thiserror = { workspace = true }

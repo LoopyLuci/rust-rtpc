@@ -1,0 +1,55 @@
+# Continuous integration
+
+Name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TARGET_DIR: X:/cargo-target
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install cargo-binstall
+        run: |
+          curl -b "license=no&accept-source=yes" -L -o binstall.zip \
+            https://github.com/cargo-bins/cargo-binstall/releases/latest/download/cargo-binstall-x86_64-windows.zip
+          unzip binstall.zip
+          ./cargo-binstall.exe --version
+
+      - name: Install cargo-nextest
+        run: cargo binstall cargo-nextest --trust-approve || cargo install cargo-nextest --locked
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            X:/cargo-target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo nextest run --workspace --locked || cargo test --workspace --locked

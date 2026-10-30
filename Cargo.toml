@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+
+members = [
+    "crates/rpc-core",
+    "crates/rpc-vfs",
+    "crates/rpc-diagnostics",
+    "crates/rpc-codegen",
+    "crates/rpc-sandbox",
+    "crates/rpc-cache",
+    "crates/rpc-frontend",
+    "crates/rpc-daemon",
+    "crates/rpc-cli",
+    "crates/rpc-api",
+    "crates/rpc-mcp",
+    "crates/rpc-acp",
+    "fixtures/sample-workspace",
+]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[workspace.package]
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.98"
+repository = "https://github.com/nousresearch/rust-rtpc"
+
+[workspace.dependencies]
+# Shared dependencies are declared here and inherited by member crates.
+# They are only fetched when a member actually lists them.
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env", "fmt"] }

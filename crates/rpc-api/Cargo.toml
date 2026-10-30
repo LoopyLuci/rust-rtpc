@@ -1,0 +1,15 @@
+[package]
+name = "rpc-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Real-time Rust pre-compiler: rpc-api crate."
+
+[dependencies]
+rpc-daemon = { path = "../rpc-daemon" }
+rpc-core = { path = "../rpc-core" }
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["rt-multi-thread"] }

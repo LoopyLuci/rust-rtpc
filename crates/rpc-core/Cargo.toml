@@ -1,0 +1,58 @@
+[package]
+name = "rpc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Real-time Rust pre-compiler: IncrementalEngine trait + query engine (rpc-core crate)."
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+rpc-diagnostics = { path = "../rpc-diagnostics" }
+
+[features]
+default = []
+salsa = ["dep:ra_ap_ide", "dep:ra_ap_ide_db", "dep:ra_ap_ide_diagnostics", "dep:ra_ap_paths", "dep:triomphe"]
+
+[dependencies.ra_ap_cfg]
+optional = true
+version = "0.0.358"
+
+[dependencies.ra_ap_ide]
+optional = true
+version = "0.0.358"
+
+[dependencies.ra_ap_ide_db]
+optional = true
+version = "0.0.358"
+
+[dependencies.ra_ap_ide_diagnostics]
+optional = true
+version = "0.0.358"
+
+[dependencies.ra_ap_parser]
+optional = true
+version = "0.0.360"
+
+[dependencies.ra_ap_syntax]
+optional = true
+version = "0.0.358"
+
+[dependencies.ra_ap_vfs]
+optional = true
+version = "0.0.358"
+
+[dependencies.triomphe]
+optional = true
+version = "0.1.14"
+features = ["std"]
+default-features = false
+
+[dependencies.ra_ap_paths]
+optional = true
+version = "0.0.358"
+
+[lib]
+path = "src/lib.rs"
