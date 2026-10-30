@@ -42,19 +42,17 @@ These gaps are exactly where purpose-built models earn their keep.
 - **Plugs into:** `salsa_engine/mod.rs:123-131` (`query`) + `apply_changes` (`:100-109`).
 - **Problem:** the engine rebuilds the *whole* ra_ap world per query even when
   one line changed.
-- **Model:** a learned change-impact model. Input features: changed file paths,
-  revision delta size, per-file byte-diff, dependency-graph edges touched,
-  diagnostic density of each file. Output: the set of files/diagnostics that
-  are actually invalidated, so the engine re-derives only those and serves the
-  rest from cache. A small GNN over the crate graph or a transformer over the
-  file-diff sequence.
+- **Model:** a **tiny** 2-layer GNN over the crate dependency graph (~1.5 M
+  params) OR a 1-layer transformer over the file-diff sequence. Inputs: changed
+  file paths, revision delta, per-file byte-diff, dep-graph edges touched,
+  diagnostic density. Output: the set of files/diagnostics actually invalidated.
 - **Data source (already generated):** during validation the system computes
   both the full-rebuild diagnostic set and the incremental subset — that
   `(ChangePack → invalidated set)` pairing is the training label, free.
-- **Integration:** in-process ONNX (`ort`/`tract`) for the tiny model; a
-  `ScopePredictor` consulted before `query`.
-- **Gain:** the direct path to the sub-100 ms goal — potentially 10–50× fewer
-  full rebuilds.
+- **Integration:** in-process ONNX (CPU EP); a `ScopePredictor` consulted before
+  `query`.
+- **Gain:** the direct path to sub-100 ms — potentially 10–50× fewer full
+  rebuilds for ~100:1 return at ~6 ms cost.
 
 ### M2. Query Latency Predictor / Dynamic Timeout Tuner
 - **Plugs into:** `types.rs:54-56` (`timeout_ms`) + `service.rs:168-176` (`query`).
@@ -91,8 +89,8 @@ These gaps are exactly where purpose-built models earn their keep.
 - **Plugs into:** `mod.rs:46-49` (the `.filter()` before `map_diagnostic`).
 - **Problem:** ra_ap emits many diagnostics; irrelevant noise wastes agent
   context and reasoning time.
-- **Model:** distilled text classifier (DistilBERT / 6-layer transformer)
-  scoring each diagnostic's relevance to the current task + file context.
+- **Model:** a **tiny** 2-layer transformer (d=64, ~3 M params), not DistilBERT
+  (66 M). Scores each diagnostic's relevance to the current task + file context.
 - **Data source:** severity × actionability × whether an agent later fixed it
   (learnable from fix-order / git history).
 - **Integration:** in-process ONNX; only the top-k reach the wire.
@@ -101,14 +99,17 @@ These gaps are exactly where purpose-built models earn their keep.
 ### M5. Codefix / Suggestion Generator
 - **Plugs into:** `mod.rs:69-70` (`suggestions: Vec::new()`).
 - **Problem:** diagnostics are reported but never actionable.
-- **Model:** a fine-tuned code-edit model (T5-small or CodeGen-350M) mapping
-  `(diagnostic code, message, source around the span)` → a `replacement`
-  string.
-- **Data source:** rustc diagnostic → gold-fix pairs (publicly available),
-  augmented with the project's own diagnostics.
-- **Integration:** sidecar `llama-server` (for a larger model) or in-process
-  ONNX (T5-small). Fills `Suggestion { description, span, replacement }`.
-- **Gain:** agents get machine-actionable fixes immediately.
+- **Model:** a **small-edit NN** (~1.2 M params, 1-layer transformer, d=128)
+  mapping `(diagnostic code, message, source around the span)` → a `replacement`
+  string. Trained on the frequent fix patterns (missing semicolon, unused var,
+  type mismatch, etc.) that cover ~80% of diagnostics. **Optional**: for hard
+  fixes, fall back to a 1–3 B GGUF codefix LLM via `llama.server` — strictly
+  opt-in, most users never need it.
+- **Data source:** rustc diagnostic → gold-fix pairs + the project's own
+  diagnostics.
+- **Integration:** in-process ONNX for the small NN; sidecar only for the
+  optional LLM. Fills `Suggestion { description, span, replacement }`.
+- **Gain:** agents get machine-actionable fixes instantly; no daemon stall.
 
 ### M6. Diagnostic Code Classifier / Router
 - **Plugs into:** `mod.rs:54-60` (`map_diagnostic` severity match).
@@ -125,10 +126,10 @@ These gaps are exactly where purpose-built models earn their keep.
 - **Plugs into:** `mod.rs:68` (`message: d.message`).
 - **Problem:** ra_ap/rustc messages are terse; agents (and LLMs) read faster
   with clearer phrasing.
-- **Model:** small seq2seq (T5-small) fine-tuned to rewrite terse compiler
-  messages into clearer, context-aware explanations.
+- **Model:** a **tiny** 2-layer seq2seq (d=64, ~2 M params), not T5-small.
+  Rewrites terse compiler messages into clearer, context-aware explanations.
 - **Integration:** in-process ONNX; rewrites `message` before emit.
-- **Gain:** faster agent comprehension.
+- **Gain:** faster agent comprehension; no daemon stall.
 
 ---
 
@@ -176,16 +177,49 @@ These gaps are exactly where purpose-built models earn their keep.
 
 ---
 
+## Sizing & ROI — every model sized for CPU-anywhere
+
+The rule: each model must cost *less* (CPU ms + RAM) than the latency it removes,
+and must run on bare CPU. GPU is a free accelerator, never a dependency.
+
+| ID | Model | Params | CPU latency | CPU RAM | GPU optional? | ROI (gain : cost) |
+|----|-------|--------|-------------|---------|---------------|-------------------|
+| M1 | Change-impact GNN (2-layer) | ~1.5 M | 3–6 ms | ~10 MB | CUDA/ROCm EP | 10–50× fewer rebuilds (100+ ms each) → ~100:1 |
+| M2 | Latency GBT (100 trees, shallow) | 0 (trees) | <1 ms | ~500 KB | N/A | kills timeouts, ~no cost |
+| M3 | Prefetch GRU (1 layer, d=32) | ~0.5 M | 1–2 ms | ~5 MB | CUDA/ROCm EP | cold→warm hit, 5–20× read |
+| M4 | Relevance tiny-transformer (2L, d=64) | ~3 M | 2–4 ms | ~15 MB | CUDA/ROCm EP | cuts agent context 2–4× |
+| M5 | Codefix small-edit NN (1L, d=128) | ~1.2 M | ~3 ms | ~12 MB | CUDA/ROCM EP | common fixes returned instantly; hard fixes fall back to optional 1–3 B GGUF sidecar (llama.cpp, not required) |
+| M6 | Code-classifier (logistic, 12 dims) | 0 (weights) | <0.1 ms | ~1 KB | N/A | routes to right fixer ~free |
+| M7 | Rewriter tiny-seq2seq (2L, d=64) | ~2 M | 4–6 ms | ~12 MB | CUDA/ROCm EP | faster agent reads, ~no daemon stall |
+| M8 | Backend-selector GBT (100 trees) | 0 (trees) | <1 ms | ~400 KB | N/A | ~no cost, faster debug builds |
+| M9 | Env-policy logistic (per family) | ~50 weights | <0.05 ms | ~1 KB | N/A | ~free, stronger cred guard |
+| M10 | Degradation anomaly (EWMA+thresh) | 0 (rules+stat) | <0.01 ms | ~1 KB | N/A | ~free, early warning |
+| M11 | Scheduler bandit (LinUCB) | 0 (linear) | <0.1 ms | ~1 KB | N/A | ~free, smarter queue |
+
+**Architecture choice per model** (CPU-first):
+- The NN models (M1, M3, M4, M5, M7) compile to **ONNX** and run via
+  `ort` with the **CPU Execution Provider**. They are sized so total CPU time
+  stays under ~5 ms each — well below the 50–100+ ms they shave off.
+- The non-NN models (M2, M6, M8, M9, M10, M11) use **trees / linear / rule+stat**
+  families — sub-millisecond, ~1 KB RAM, zero GPU surface area.
+- **GPU is optional**: every ONNX model also exposes a CUDA/ROCm EP (this host
+  has a 7900 XTX); when absent, CPU EP is the floor, not a fallback path.
+- **No GPU required** by any model. The only exception is M5's optional larger
+  codefix LLM (1–3 B GGUF via llama.cpp) — strictly opt-in, and common fixes are
+  handled by the 1.2 M-param NN so most users never need it.
+
 ## Integration strategy (how models run)
 
 Two mechanisms, chosen per model:
 
-1. **In-process ONNX** (`ort` = libonnxruntime, or `tract` = pure Rust) for the
-   small models (M1, M2, M3, M4, M6, M7, M8, M9, M10). Tiny models run at
-   single-digit ms on CPU — no sidecar, no IPC, no daemon stall. This is the
-   right call for latency-critical paths.
-2. **Sidecar `llama-server`** (via the existing `rpc-codegen` restricted-process
-   path, or a new MCP tool) for the larger generative model (M5 codefix). The
+1. **In-process ONNX** (`ort` = libonnxruntime, CPU EP as the floor) for the
+   small NN models (M1, M3, M4, M5-small, M7). They run at single-digit ms on CPU
+   — no sidecar, no IPC, no daemon stall. `ort` is a small Rust crate; the
+   binary grows by ~3–5 MB, acceptable for a pre-compiler.
+2. **Trees / linear / rule+stat** — compiled as tiny Rust modules (no runtime
+   dependency) for M2, M6, M8, M9, M10, M11. Sub-ms, zero-RAM models.
+3. **Sidecar `llama-server`** (via the existing `rpc-codegen` restricted-process
+   path, or a new MCP tool) only for M5's *optional* larger codefix LLM. The
    daemon already has the subprocess + watchdog machinery to manage it.
 
 ## Host constraints (this machine)
